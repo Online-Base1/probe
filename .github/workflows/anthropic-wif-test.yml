@@ -64,6 +64,7 @@ jobs:
           set -euo pipefail
           /tmp/venv/bin/python - <<'PY'
           import os
+          import re
           import sys
 
           from anthropic import Anthropic
@@ -100,10 +101,38 @@ jobs:
               )
           )
 
+          def error_fields(exc):
+              # Тело ошибки: Messages API отдаёт {"error": {"type", "message"}},
+              # обмен токена (RFC 6749) — {"error", "error_description"}; SDK
+              # для WorkloadIdentityError уже оставляет только эти поля.
+              body = getattr(exc, "body", None)
+              if not isinstance(body, dict):
+                  return None, None
+              err = body.get("error")
+              if isinstance(err, dict):
+                  return err.get("type"), err.get("message")
+              if isinstance(err, str):
+                  return err, body.get("error_description") or body.get("message")
+              return None, body.get("message")
+
+          def scrub(text):
+              # Токены, JWT и заголовки не печатаются, даже если сервер их вернул.
+              text = re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*", "<jwt>", str(text))
+              text = re.sub(r"sk-ant-[A-Za-z0-9_-]+", "<key>", text)
+              text = re.sub(r"(?i)bearer\s+\S+", "Bearer <redacted>", text)
+              return " ".join(text.split())[:300]
+
           def fail(what, exc):
-              # Текст исключения SDK не печатаем; только тип и статус.
+              # Полный текст исключения не печатаем: только тип, статус и поля
+              # error/message из тела ответа, если они есть.
               status = getattr(exc, "status_code", None)
-              print(f"::error::{what} failed: {type(exc).__name__} status={status}")
+              etype, emsg = error_fields(exc)
+              detail = ""
+              if etype:
+                  detail += f" error={scrub(etype)}"
+              if emsg:
+                  detail += f" message={scrub(emsg)}"
+              print(f"::error::{what} failed: {type(exc).__name__} status={status}{detail}")
               sys.exit(1)
 
           try:

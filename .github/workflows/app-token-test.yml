@@ -4,7 +4,7 @@
 #        черновик PR — это ровно то, что нужно агенту;
 #   (в−) тот же токен НЕ может создать .github/workflows/x.yml, потому что у
 #        приложения нет права Workflows. Ожидается 403/404; любой другой код,
-#        включая успех, — провал теста;
+#        включая успех, — провал теста. Если файл создан, ветка удаляется;
 #   (в−git) то же через git push: PASS только если push отклонён и в выводе
 #        есть "workflow". Если push прошёл, ветка удаляется через API;
 #   (г)  номер созданного PR печатается, чтобы вручную убедиться, что ci.yml
@@ -40,7 +40,7 @@ jobs:
         id: app
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.FACTORY_APP_ID }}
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
           private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
@@ -53,6 +53,11 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
         run: |
+          # Раннер запускает `shell: bash` как `bash -e -o pipefail`. Здесь
+          # ожидаемые отказы (403, отклонённый push) — это результат проверки,
+          # а не сбой шага, поэтому -e снимается и каждый код разбирается явно.
+          # Прогон 36304253561 оборвался именно на отклонённом git push.
+          set +e
           set -uo pipefail
           echo "::add-mask::$TOKEN"
           api() { # api METHOD PATH [JSON] -> печатает код, тело в /tmp/body.json
@@ -65,11 +70,18 @@ jobs:
             curl "${args[@]}" "https://api.github.com/repos/$REPO$path"
           }
           b64() { printf '%s' "$1" | base64 -w0; }
+          delete_branch() { # тест не должен оставлять ветку с workflow-файлом
+            local code
+            code="$(api DELETE "/git/refs/heads/$branch")"
+            echo "DELETE ref $branch -> $code (expected 204)"
+            branch_deleted=1
+          }
 
           branch="agent/selftest-$RUN_ID"
           pos_ok=1
           neg_ok=0
           git_ok=0
+          branch_deleted=0
 
           # (в+) ветка от main
           code="$(api GET /git/ref/heads/main)"; echo "GET  ref main            -> $code"
@@ -114,6 +126,10 @@ jobs:
             jq -r '"     message: " + (.message // "")' /tmp/body.json
             case "$code" in
               403|404) neg_ok=1 ;;
+              2??)
+                neg_ok=0
+                echo "::error::(в−) workflow file was CREATED through the API; deleting $branch"
+                delete_branch ;;
               *) neg_ok=0 ;;
             esac
           else
@@ -123,7 +139,7 @@ jobs:
           # (в−git) тем же токеном через git push. URL с токеном не печатается;
           # весь вывод git проходит через замену токена на ***.
           redact() { sed "s/${TOKEN}/***/g"; }
-          if [ "$pos_ok" = 1 ]; then
+          if [ "$pos_ok" = 1 ] && [ "$branch_deleted" = 0 ]; then
             work="$(mktemp -d)"
             if git clone --quiet --depth 1 --branch "$branch" \
                  "https://x-access-token:${TOKEN}@github.com/$REPO" "$work/repo" 2> "$work/clone.err"; then
@@ -134,19 +150,28 @@ jobs:
               printf 'name: y\non: workflow_dispatch\njobs:\n  y:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n' \
                 > .github/workflows/y.yml
               git add .github/workflows/y.yml
-              git commit --quiet -m "selftest: app token must NOT push workflows ($RUN_ID)"
-              git push origin HEAD > "$work/push.out" 2> "$work/push.err"
-              push_rc=$?
+              # Без нового коммита push ответит «Everything up-to-date» с кодом 0,
+              # и это ложно читалось бы как принятый workflow-файл.
+              if git commit --quiet -m "selftest: app token must NOT push workflows ($RUN_ID)"; then
+                if git push origin HEAD > "$work/push.out" 2> "$work/push.err"; then push_rc=0; else push_rc=$?; fi
+              else
+                push_rc=""
+              fi
               cd - > /dev/null
-              echo "git push origin HEAD -> exit $push_rc (expected non-zero)"
-              echo "     stderr:"
-              redact < "$work/push.err" | sed 's/^/       /'
-              if [ "$push_rc" -ne 0 ] && grep -qi "workflow" "$work/push.err"; then
+              if [ -z "$push_rc" ]; then
+                echo "(в−git) local commit failed; push not attempted, nothing is proven"
+              else
+                echo "git push origin HEAD -> exit $push_rc (expected non-zero)"
+                echo "     stderr:"
+                redact < "$work/push.err" | sed 's/^/       /'
+              fi
+              if [ -z "$push_rc" ]; then
+                :
+              elif [ "$push_rc" -ne 0 ] && grep -qi "workflow" "$work/push.err"; then
                 git_ok=1
               elif [ "$push_rc" -eq 0 ]; then
                 echo "::error::(в−git) push of a workflow file SUCCEEDED; deleting $branch"
-                code="$(api DELETE "/git/refs/heads/$branch")"
-                echo "DELETE ref $branch -> $code (expected 204)"
+                delete_branch
               else
                 echo "(в−git) push failed, but not with a workflow-permission refusal"
               fi
@@ -155,6 +180,8 @@ jobs:
               redact < "$work/clone.err" | sed 's/^/       /'
             fi
             rm -rf "$work"
+          elif [ "$branch_deleted" = 1 ]; then
+            echo "(в−git) not run: branch was deleted after the (в−) breach"
           else
             echo "(в−git) not run: positive check failed, the branch may not exist"
           fi
