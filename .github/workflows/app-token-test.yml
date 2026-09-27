@@ -6,7 +6,10 @@
 #        приложения нет права Workflows. Ожидается 403/404; любой другой код,
 #        включая успех, — провал теста. Если файл создан, ветка удаляется;
 #   (в−git) то же через git push: PASS только если push отклонён и в выводе
-#        есть "workflow". Если push прошёл, ветка удаляется через API;
+#        есть отказ GitHub по праву workflows ("refusing to allow a GitHub App
+#        to create or update workflow"). Одно слово "workflow" не годится: оно
+#        есть в самом пути .github/workflows/y.yml при любой другой ошибке.
+#        Если push прошёл, ветка удаляется через API;
 #   (г)  номер созданного PR печатается, чтобы вручную убедиться, что ci.yml
 #        запустился на заявке, открытой приложением.
 #
@@ -167,7 +170,7 @@ jobs:
               fi
               if [ -z "$push_rc" ]; then
                 :
-              elif [ "$push_rc" -ne 0 ] && grep -qi "workflow" "$work/push.err"; then
+              elif [ "$push_rc" -ne 0 ] && grep -qiE 'refusing to allow a GitHub App to create or update workflow' "$work/push.err"; then
                 git_ok=1
               elif [ "$push_rc" -eq 0 ]; then
                 echo "::error::(в−git) push of a workflow file SUCCEEDED; deleting $branch"
