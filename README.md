@@ -16,3 +16,35 @@ Playwright.
 - `CLAUDE.md` с зонами ответственности;
 - пины версий и allowlist install-скриптов;
 - `security-baseline.json` — снимок `npm audit` на момент создания.
+
+## Локальный запуск
+
+Установка зависимостей:
+
+```bash
+npm install
+```
+
+Запуск приложения в режиме разработки:
+
+```bash
+npm run dev
+```
+
+Запуск unit-тестов:
+
+```bash
+npm run test:unit
+```
+
+Запуск e2e-тестов:
+
+```bash
+npm run test:e2e
+```
+
+Запуск линтера:
+
+```bash
+npm run lint
+```
