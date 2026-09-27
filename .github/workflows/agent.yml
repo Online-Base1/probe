@@ -10,6 +10,10 @@
 #
 # Ключ модели не используется: только федерация OIDC. Правило федерации
 # совпадает лишь с refs/heads/main, поэтому запуск с другой ветки отказывает.
+#
+# Блокер для schedule: установщик Claude Code не прибит (curl | bash внутри
+# action). До расписания — своя установка CLI по версии с проверкой
+# контрольной суммы.
 name: agent
 
 on:
@@ -28,7 +32,7 @@ concurrency:
 
 jobs:
   role:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Потолок времени прогона. Вместе с --max-turns 25 ограничивает расход
     # одного запуска; расписания нет, запуск только вручную.
     timeout-minutes: 30
@@ -42,6 +46,13 @@ jobs:
         run: |
           echo "::error::agent runs only from refs/heads/main (federation rule and envelope)"
           exit 1
+
+      # Начало окна прогона: после роли проверяются все ветки, чей последний
+      # коммит не старше этого момента. Фиксируется до выпуска токена.
+      - name: Record run start
+        id: start
+        shell: bash
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Mint app installation token
         id: app
@@ -96,27 +107,57 @@ jobs:
             ${{ inputs.task }}
 
       # Механическая проверка рамки 4 по GitHub API, а не по рабочей копии
-      # агента: локальный git агент мог изменить (ветка, reset, история), а
-      # compare на стороне GitHub показывает то, что реально лежит в ветке.
-      # .github/workflows/ защищён ещё и отсутствием права Workflows у
-      # приложения; остальные пути — только здесь.
+      # агента: compare на стороне GitHub показывает то, что реально лежит в
+      # ветке. Проверяются ВСЕ ветки, кроме main, чей последний коммит не
+      # старше начала прогона: ветка вне agent/ — уже нарушение, и у каждой
+      # ветки из окна сверяются запрещённые пути. .github/workflows/ защищён
+      # ещё и отсутствием права Workflows у приложения; остальные пути — только
+      # здесь.
       - name: Verify envelope via GitHub API
         if: ${{ !cancelled() }}
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
-          PREFIX: agent/${{ steps.date.outputs.today }}-
+          START: ${{ steps.start.outputs.at }}
         run: |
           set -euo pipefail
-          refs="$(gh api "repos/$REPO/git/matching-refs/heads/$PREFIX" --jq '.[].ref')"
-          if [ -z "$refs" ]; then
-            echo "no branches matching $PREFIX*; nothing to verify"
+          if [ -z "${START:-}" ]; then
+            echo "::error::run start time is unknown; envelope cannot be verified"
+            exit 1
+          fi
+          # Все ветки с датой последнего коммита, постранично (GraphQL, по 100).
+          gh api graphql --paginate \
+            -f owner="${REPO%%/*}" -f name="${REPO##*/}" \
+            -f query='query($owner: String!, $name: String!, $endCursor: String) {
+              repository(owner: $owner, name: $name) {
+                refs(refPrefix: "refs/heads/", first: 100, after: $endCursor) {
+                  pageInfo { hasNextPage endCursor }
+                  nodes { name target { ... on Commit { committedDate } } }
+                }
+              }
+            }' \
+            --jq '.data.repository.refs.nodes[] | [.name, (.target.committedDate // "")] | @tsv' \
+            > /tmp/branches.tsv
+          echo "branches listed: $(wc -l < /tmp/branches.tsv | tr -d ' '); window starts $START"
+
+          # Обе даты — UTC в формате YYYY-MM-DDTHH:MM:SSZ, строки сравнимы.
+          # Нет даты — ветка считается попавшей в окно (fail-closed).
+          in_window="$(awk -F '\t' -v start="$START" \
+            '$1 != "main" && ($2 == "" || $2 >= start) { print $1 }' /tmp/branches.tsv)"
+          if [ -z "$in_window" ]; then
+            echo "no branches changed since $START; nothing to verify"
             exit 0
           fi
+
           bad=0
-          for ref in $refs; do
-            branch="${ref#refs/heads/}"
+          while IFS= read -r branch; do
+            case "$branch" in
+              agent/*) ;;
+              *)
+                echo "::error::$branch changed during the run but is outside agent/"
+                bad=1 ;;
+            esac
             gh api "repos/$REPO/compare/main...$branch" > /tmp/compare.json
             # Нет массива files — список не виден, значит проверка не доказана.
             if ! jq -e '.files | type == "array"' /tmp/compare.json > /dev/null; then
@@ -142,7 +183,7 @@ jobs:
               echo "$forbidden"
               bad=1
             else
-              echo "envelope OK on $branch ($n files)"
+              echo "paths OK on $branch ($n files)"
             fi
-          done
+          done <<< "$in_window"
           exit "$bad"
