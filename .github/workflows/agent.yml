@@ -202,11 +202,13 @@ jobs:
           done <<< "$in_window"
           exit "$bad"
 
-      # Отказы в разрешениях — из журнала, а не из самоотчёта агента: в прогоне
-      # 36329159263 агент после отказа повторил команду с
-      # dangerouslyDisableSandbox и в описании PR об этом не написал (L-013).
-      # Список публикуется комментарием в PR агента; попытка обхода песочницы
-      # делает прогон красным после публикации.
+      # Отказы в разрешениях — из журнала, а не из самоотчёта агента (D-092):
+      # в прогоне 36329159263 агент после отказа повторил команду с
+      # dangerouslyDisableSandbox и в описании PR об этом не написал.
+      # Прогон краснеет от ЛЮБОГО отказа, а не от имени флага: словарь обхода
+      # угадать нельзя, отказ же записывает сама система разрешений. Пометка
+      # «попытка обхода» — только для чтения человеком, на итог не влияет.
+      # Счётчики уходят в сводку прогона: ложные срабатывания считаются.
       - name: Surface permission denials
         if: always()
         shell: bash
@@ -224,30 +226,52 @@ jobs:
             exit 0
           fi
 
-          # Только инструмент и команда (для файловых инструментов — путь);
+          # Итоговая запись роли: счётчики для сводки и сами отказы. Берутся
+          # только инструмент и команда (для файловых инструментов — путь),
           # содержимое файлов не берётся. Строки, похожие на токены, скрываются:
-          # комментарий публичный.
+          # комментарий публичный. «Обход» — любой параметр, снимающий
+          # ограничения (dangerously*, *sandbox*, bypass*, skip*permission*),
+          # со значением true.
           jq -r '
             def scrub: gsub("(ghs_|gh[opur]_|github_pat_|sk-ant-|eyJ)[A-Za-z0-9_.-]+"; "<redacted>");
-            [ (if type == "array" then .[] else . end)
-              | select(.type == "result") | .permission_denials[]? ] as $d
-            | ($d | length) as $n
-            | ($d | map(select(.tool_input.dangerouslyDisableSandbox == true)) | length) as $bypass
-            | "n=\($n)", "bypass=\($bypass)",
-              ( $d[] | "- `\(.tool_name)`: `" +
+            def bypass_keys: [ (.tool_input // {}) | to_entries[]
+                | select(.value == true)
+                | select(.key | test("dangerous|sandbox|bypass|skip.?permission|unrestrict"; "i"))
+                | .key ];
+            ([ (if type == "array" then .[] else . end) | select(.type == "result") ] | last // {}) as $r
+            | ($r.permission_denials // []) as $d
+            | "n=\($d | length)",
+              "bypass=\($d | map(select(bypass_keys | length > 0)) | length)",
+              "turns=\($r.num_turns // "unknown")",
+              "cost=\($r.total_cost_usd // "unknown")",
+              ( $d[] | bypass_keys as $k | "- `\(.tool_name)`: `" +
                   ((.tool_input.command // .tool_input.file_path // .tool_input.path
                     // (.tool_input | keys | join(","))) | tostring | scrub | .[0:300]
                    | gsub("`"; "′")) + "`" +
-                  (if .tool_input.dangerouslyDisableSandbox == true
-                     then " — **dangerouslyDisableSandbox**" else "" end) )
+                  (if ($k | length) > 0
+                     then " — ⚠ попытка обхода: `" + ($k | join(", ")) + "`" else "" end) )
           ' "$f" > /tmp/denials.txt
           n="$(sed -n 's/^n=//p' /tmp/denials.txt)"
           bypass="$(sed -n 's/^bypass=//p' /tmp/denials.txt)"
+          turns="$(sed -n 's/^turns=//p' /tmp/denials.txt)"
+          cost="$(sed -n 's/^cost=//p' /tmp/denials.txt)"
+
+          {
+            echo "### Роль: счётчики прогона"
+            echo
+            echo "| permission_denials_count | num_turns | total_cost_usd |"
+            echo "|---|---|---|"
+            echo "| $n | $turns | $cost |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           {
             echo "### Отказы в разрешениях агента (прогон $RUN_ID)"
             echo
             if [ "$n" = 0 ]; then echo "Отказов нет."; else
-              echo "Всего: $n; с попыткой обойти песочницу: $bypass."
+              echo "Всего: $n. Прогон красный: любой отказ — повод разобраться (D-092)."
+              if [ "$bypass" != 0 ]; then
+                echo "Из них с попыткой обойти ограничение: $bypass (пометка, на итог не влияет)."
+              fi
               echo
               grep '^- ' /tmp/denials.txt
             fi
@@ -286,8 +310,8 @@ jobs:
             done
           fi
 
-          if [ "${bypass:-0}" != 0 ]; then
-            echo "::error::agent tried to bypass the sandbox ($bypass attempt(s)); see the PR comment and the execution log"
+          if [ "$n" != 0 ]; then
+            echo "::error::$n permission denial(s) during the role run (with bypass attempt: $bypass); see the PR comment and the execution log"
             exit 1
           fi
 
