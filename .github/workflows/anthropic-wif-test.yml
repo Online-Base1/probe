@@ -1,0 +1,121 @@
+# Проверка федерации OIDC к модели (D-083, D-084). Агент здесь не участвует:
+# один минимальный запрос, и прогон зелёный только при реальном ответе модели.
+#
+# Правило федерации factory-probe-main совпадает только с
+# ref=refs/heads/main этого репозитория. Запуск с любой другой ветки обязан
+# получить отказ — это тоже проверка, а не сбой.
+#
+# Ключ модели здесь не используется ни в каком виде: клиент строится с явным
+# credentials=, и SDK в этом случае не читает переменные окружения с ключом.
+name: anthropic-wif-test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: anthropic-wif-test
+  cancel-in-progress: false
+
+jobs:
+  federation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # OIDC-токен берётся curl'ом по ACTIONS_ID_TOKEN_REQUEST_URL, а не через
+      # actions/github-script: это не добавляет ещё одно стороннее действие,
+      # которое пришлось бы прибивать и которому пришлось бы доверять токен.
+      - name: Request GitHub OIDC token (audience https://api.anthropic.com)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          resp="$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://api.anthropic.com")"
+          jwt="$(jq -r '.value // empty' <<<"$resp")"
+          if [ -z "$jwt" ]; then
+            echo "::error::OIDC token was not issued"
+            exit 1
+          fi
+          echo "::add-mask::$jwt"
+          printf '%s' "$jwt" > /tmp/gha-jwt
+          echo "OIDC token written to /tmp/gha-jwt (${#jwt} bytes)"
+
+      - name: Install anthropic SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet --disable-pip-version-check 'anthropic==1.8.0'
+
+      - name: Call the model through federation
+        shell: bash
+        env:
+          ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+        run: |
+          set -euo pipefail
+          /tmp/venv/bin/python - <<'PY'
+          import os
+          import sys
+
+          from anthropic import Anthropic
+          from anthropic.lib.credentials import IdentityTokenFile, WorkloadIdentityCredentials
+
+          MODEL = "claude-haiku-4-5-20251001"
+          # USD за миллион токенов, Haiku 4.5: вход 1, выход 5.
+          PRICE_IN, PRICE_OUT = 1.0, 5.0
+
+          for name in (
+              "ANTHROPIC_FEDERATION_RULE_ID",
+              "ANTHROPIC_ORGANIZATION_ID",
+              "ANTHROPIC_SERVICE_ACCOUNT_ID",
+              "ANTHROPIC_WORKSPACE_ID",
+          ):
+              if not os.environ.get(name):
+                  print(f"::error::repository variable {name} is empty")
+                  sys.exit(1)
+
+          client = Anthropic(
+              credentials=WorkloadIdentityCredentials(
+                  identity_token_provider=IdentityTokenFile("/tmp/gha-jwt"),
+                  federation_rule_id=os.environ["ANTHROPIC_FEDERATION_RULE_ID"],
+                  organization_id=os.environ["ANTHROPIC_ORGANIZATION_ID"],
+                  service_account_id=os.environ["ANTHROPIC_SERVICE_ACCOUNT_ID"],
+                  workspace_id=os.environ["ANTHROPIC_WORKSPACE_ID"],
+              )
+          )
+
+          try:
+              msg = client.messages.create(
+                  model=MODEL,
+                  max_tokens=16,
+                  messages=[{"role": "user", "content": "Reply with the single word: ok"}],
+              )
+          except Exception as exc:
+              # Текст исключения SDK не содержит токенов; печатаем только тип и статус.
+              status = getattr(exc, "status_code", None)
+              print(f"::error::federated request failed: {type(exc).__name__} status={status}")
+              sys.exit(1)
+
+          text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+          if not text or msg.usage.output_tokens < 1:
+              print("::error::model returned no text; access is not proven")
+              sys.exit(1)
+
+          cost = (msg.usage.input_tokens * PRICE_IN + msg.usage.output_tokens * PRICE_OUT) / 1_000_000
+          print("federation OK: model answered")
+          print(f"model={msg.model} stop_reason={msg.stop_reason}")
+          print(f"tokens in={msg.usage.input_tokens} out={msg.usage.output_tokens} cost_usd={cost:.6f}")
+          PY
+
+      - name: Remove OIDC token file
+        if: always()
+        shell: bash
+        run: rm -f /tmp/gha-jwt
