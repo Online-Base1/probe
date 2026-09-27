@@ -1,0 +1,130 @@
+# Проверка токена приложения online-base1-factory-worker (D-084).
+#
+#   (в+) токен может создать ветку agent/selftest-<run_id>, файл в ней и
+#        черновик PR — это ровно то, что нужно агенту;
+#   (в−) тот же токен НЕ может создать .github/workflows/x.yml, потому что у
+#        приложения нет права Workflows. Ожидается 403/404; любой другой код,
+#        включая успех, — провал теста;
+#   (г)  номер созданного PR печатается, чтобы вручную убедиться, что ci.yml
+#        запустился на заявке, открытой приложением.
+#
+# Созданные ветка и черновик PR остаются как свидетельство; закрываются вручную.
+name: app-token-test
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: app-token-test
+  cancel-in-progress: false
+
+jobs:
+  app-token:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse to run outside main
+        if: github.ref != 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "::error::app-token-test runs only from refs/heads/main"
+          exit 1
+
+      - name: Mint app installation token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Positive and negative checks through the API
+        shell: bash
+        env:
+          TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          api() { # api METHOD PATH [JSON] -> печатает код, тело в /tmp/body.json
+            local method="$1" path="$2" data="${3:-}"
+            local args=(-sS -o /tmp/body.json -w '%{http_code}' -X "$method"
+              -H "Authorization: Bearer $TOKEN"
+              -H "Accept: application/vnd.github+json"
+              -H "X-GitHub-Api-Version: 2022-11-28")
+            [ -n "$data" ] && args+=(-d "$data")
+            curl "${args[@]}" "https://api.github.com/repos/$REPO$path"
+          }
+          b64() { printf '%s' "$1" | base64 -w0; }
+
+          branch="agent/selftest-$RUN_ID"
+          pos_ok=1
+          neg_ok=0
+
+          # (в+) ветка от main
+          code="$(api GET /git/ref/heads/main)"; echo "GET  ref main            -> $code"
+          main_sha="$(jq -r '.object.sha // empty' /tmp/body.json)"
+          [ "$code" = 200 ] && [ -n "$main_sha" ] || pos_ok=0
+
+          if [ "$pos_ok" = 1 ]; then
+            code="$(api POST /git/refs "$(jq -nc --arg r "refs/heads/$branch" --arg s "$main_sha" '{ref:$r,sha:$s}')")"
+            echo "POST ref $branch -> $code"
+            [ "$code" = 201 ] || pos_ok=0
+          fi
+
+          # (в+) файл вне .github/ в этой ветке
+          if [ "$pos_ok" = 1 ]; then
+            code="$(api PUT "/contents/selftest/$RUN_ID.md" "$(jq -nc \
+              --arg m "selftest: app token writes a file ($RUN_ID)" \
+              --arg c "$(b64 "app-token-test run $RUN_ID")" --arg b "$branch" \
+              '{message:$m,content:$c,branch:$b}')")"
+            echo "PUT  selftest/$RUN_ID.md -> $code"
+            [ "$code" = 201 ] || pos_ok=0
+          fi
+
+          # (в+) черновик PR; (г) его номер
+          pr_number=""
+          if [ "$pos_ok" = 1 ]; then
+            code="$(api POST /pulls "$(jq -nc --arg h "$branch" --arg r "$RUN_ID" \
+              '{title:("selftest: PR opened by app (run " + $r + ", do not merge)"),
+                head:$h, base:"main", draft:true,
+                body:"Created by app-token-test.yml. Check that ci.yml ran on this PR, then close it."}')")"
+            echo "POST pull (draft)        -> $code"
+            pr_number="$(jq -r '.number // empty' /tmp/body.json)"
+            [ "$code" = 201 ] && [ -n "$pr_number" ] || pos_ok=0
+          fi
+
+          # (в−) тем же токеном в той же ветке — файл workflow
+          if [ "$pos_ok" = 1 ]; then
+            code="$(api PUT /contents/.github/workflows/x.yml "$(jq -nc \
+              --arg m "selftest: app token must NOT write workflows ($RUN_ID)" \
+              --arg c "$(b64 $'name: x\non: workflow_dispatch\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n')" \
+              --arg b "$branch" '{message:$m,content:$c,branch:$b}')")"
+            echo "PUT  .github/workflows/x.yml -> $code (expected 403 or 404)"
+            jq -r '"     message: " + (.message // "")' /tmp/body.json
+            case "$code" in
+              403|404) neg_ok=1 ;;
+              *) neg_ok=0 ;;
+            esac
+          else
+            echo "(в−) not run: positive check failed, the branch may not exist"
+          fi
+
+          {
+            echo "### app-token-test"
+            echo "- (в+) branch, file, draft PR: $([ "$pos_ok" = 1 ] && echo PASS || echo FAIL)"
+            echo "- (в−) workflow write refused: $([ "$neg_ok" = 1 ] && echo PASS || echo FAIL)"
+            echo "- (г) PR opened by app: ${pr_number:+#$pr_number} — check that ci.yml ran on it"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          [ -n "$pr_number" ] && echo "(г) PR opened by app: https://github.com/$REPO/pull/$pr_number"
+          [ "$pos_ok" = 1 ] || { echo "::error::(в+) positive check failed"; exit 1; }
+          [ "$neg_ok" = 1 ] || { echo "::error::(в−) workflow write was not refused with 403/404"; exit 1; }
+          echo "app token: positive PASS, negative PASS"
