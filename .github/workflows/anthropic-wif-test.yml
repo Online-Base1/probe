@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   federation:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       # Нужен только файл требований с хешами; учётные данные в git не
