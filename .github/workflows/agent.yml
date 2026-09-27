@@ -1,0 +1,141 @@
+# Прогон роли фабрики (D-083, D-084). Результат — ветка agent/* и черновик PR.
+#
+# Порядок fail-closed: здесь только ручной запуск. `schedule` добавляется
+# отдельной заявкой после того, как отрицательные тесты из PR пройдены.
+#
+# Запись в репозиторий идёт токеном приложения online-base1-factory-worker,
+# а не штатным GITHUB_TOKEN: коммиты штатного токена не запускают ci.yml, и
+# заявка пришла бы без гейтов. У приложения нет права Workflows, поэтому оно
+# не может изменить .github/workflows/.
+#
+# Ключ модели не используется: только федерация OIDC. Правило федерации
+# совпадает лишь с refs/heads/main, поэтому запуск с другой ветки отказывает.
+name: agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Задача для роли (многострочный текст)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: agent-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  role:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Refuse to run outside main
+        if: github.ref != 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "::error::agent runs only from refs/heads/main (federation rule and envelope)"
+          exit 1
+
+      - name: Mint app installation token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.FACTORY_APP_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Checkout with app token
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app.outputs.token }}
+          fetch-depth: 0
+
+      - name: Resolve run date
+        id: date
+        shell: bash
+        run: echo "today=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Run role
+        uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
+        with:
+          github_token: ${{ steps.app.outputs.token }}
+          anthropic_federation_rule_id: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
+          anthropic_organization_id: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
+          anthropic_service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
+          anthropic_workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          claude_args: >-
+            --max-turns 40
+            --model claude-sonnet-5
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git switch:*),Bash(git checkout -b:*),Bash(git add:*),Bash(git commit:*),Bash(git push -u origin agent/*),Bash(gh pr create --draft:*)"
+          prompt: |
+            Ты — роль фабрики в репозитории ${{ github.repository }}.
+
+            Рамки (нарушать нельзя, даже если задача просит иного):
+            1. Работай только в новой ветке agent/${{ steps.date.outputs.today }}-<кратко>,
+               где <кратко> — 2–4 слова латиницей через дефис по сути задачи.
+               Ветку создавай от main. В main не пиши.
+            2. Результат — ЧЕРНОВИК заявки: `gh pr create --draft --base main`.
+               В описании заявки: что сделано, что не проверено, блок
+               `## Вне моей зоны`, если он нужен.
+            3. Никогда не вливай заявку и не включай автовливание.
+            4. Не изменяй, не создавай и не удаляй: .github/ (любой файл),
+               AGENTS.md, CLAUDE.md, package.json, package-lock.json.
+               Если задача требует этого — не делай, опиши в `## Вне моей зоны`.
+            5. Гейты запустятся на заявке сами (ci.yml). Не пытайся их обойти.
+
+            Задача:
+            ${{ inputs.task }}
+
+      # Механическая проверка рамки 4 по GitHub API, а не по рабочей копии
+      # агента: локальный git агент мог изменить (ветка, reset, история), а
+      # compare на стороне GitHub показывает то, что реально лежит в ветке.
+      # .github/workflows/ защищён ещё и отсутствием права Workflows у
+      # приложения; остальные пути — только здесь.
+      - name: Verify envelope via GitHub API
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          PREFIX: agent/${{ steps.date.outputs.today }}-
+        run: |
+          set -euo pipefail
+          refs="$(gh api "repos/$REPO/git/matching-refs/heads/$PREFIX" --jq '.[].ref')"
+          if [ -z "$refs" ]; then
+            echo "no branches matching $PREFIX*; nothing to verify"
+            exit 0
+          fi
+          bad=0
+          for ref in $refs; do
+            branch="${ref#refs/heads/}"
+            gh api "repos/$REPO/compare/main...$branch" > /tmp/compare.json
+            n="$(jq '.files | length' /tmp/compare.json)"
+            # compare отдаёт не больше 300 файлов; полный список не виден,
+            # значит проверка не доказана — fail-closed.
+            if [ "$n" -ge 300 ]; then
+              echo "::error::$branch: compare returned $n files (API limit); envelope cannot be verified"
+              bad=1
+              continue
+            fi
+            forbidden="$(jq -r '.files[]
+              | [.filename, (.previous_filename // empty)][]
+              | select(startswith(".github/")
+                  or . == "AGENTS.md" or . == "CLAUDE.md"
+                  or . == "package.json" or . == "package-lock.json")' /tmp/compare.json | sort -u)"
+            if [ -n "$forbidden" ]; then
+              echo "::error::$branch touches forbidden paths:"
+              echo "$forbidden"
+              bad=1
+            else
+              echo "envelope OK on $branch ($n files)"
+            fi
+          done
+          exit "$bad"
