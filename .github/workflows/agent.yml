@@ -29,6 +29,8 @@ concurrency:
 jobs:
   role:
     runs-on: ubuntu-latest
+    # Потолок времени прогона. Вместе с --max-turns 25 ограничивает расход
+    # одного запуска; расписания нет, запуск только вручную.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -45,12 +47,11 @@ jobs:
         id: app
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.FACTORY_APP_ID }}
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
           private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
           permission-pull-requests: write
-          permission-issues: write
 
       - name: Checkout with app token
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,7 +73,7 @@ jobs:
           anthropic_service_account_id: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
           anthropic_workspace_id: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
           claude_args: >-
-            --max-turns 40
+            --max-turns 25
             --model claude-sonnet-5
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git switch:*),Bash(git checkout -b:*),Bash(git add:*),Bash(git commit:*),Bash(git push -u origin agent/*),Bash(gh pr create --draft:*)"
           prompt: |
@@ -117,6 +118,12 @@ jobs:
           for ref in $refs; do
             branch="${ref#refs/heads/}"
             gh api "repos/$REPO/compare/main...$branch" > /tmp/compare.json
+            # Нет массива files — список не виден, значит проверка не доказана.
+            if ! jq -e '.files | type == "array"' /tmp/compare.json > /dev/null; then
+              echo "::error::$branch: compare returned no files list; envelope cannot be verified"
+              bad=1
+              continue
+            fi
             n="$(jq '.files | length' /tmp/compare.json)"
             # compare отдаёт не больше 300 файлов; полный список не виден,
             # значит проверка не доказана — fail-closed.
