@@ -26,6 +26,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Нужен только файл требований с хешами; учётные данные в git не
+      # сохраняются.
+      - name: Checkout requirements
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/workflows/anthropic-wif-test.requirements.txt
+          sparse-checkout-cone-mode: false
+
       # OIDC-токен берётся curl'ом по ACTIONS_ID_TOKEN_REQUEST_URL, а не через
       # actions/github-script: это не добавляет ещё одно стороннее действие,
       # которое пришлось бы прибивать и которому пришлось бы доверять токен.
@@ -51,7 +60,12 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m venv /tmp/venv
-          /tmp/venv/bin/pip install --quiet --disable-pip-version-check 'anthropic==1.8.0'
+          # Все пакеты, включая транзитивные, закреплены версией и sha256;
+          # pip откажет, если файл на PyPI не совпадёт с хешем или зависимость
+          # не перечислена. Только колёса — сборки из исходников нет.
+          /tmp/venv/bin/pip install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary=:all: \
+            -r .github/workflows/anthropic-wif-test.requirements.txt
 
       - name: Call the model through federation
         shell: bash
