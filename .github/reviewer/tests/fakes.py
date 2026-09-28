@@ -44,6 +44,13 @@ def format_md(schema, blocks=1):
     return ("# Формат находок\n\nОтвет — JSON по схеме ниже.\n\n" + block * blocks + "\nПример: `{\"findings\": []}`\n").encode()
 
 
+def log_zip(text):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("report/1_REVIEW_RESULT.txt", text)
+    return buf.getvalue()
+
+
 def task_zip(data, name="task.txt"):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
@@ -78,6 +85,9 @@ class World:
         self.deleted = []
         self.calls = []
         self.redirect_auth = []
+        self.recent_runs = [{"id": 400, "created_at": "2026-09-29T10:00:00Z"}]
+        self.old_runs = []
+        self.run_logs = {400: log_zip("REVIEW_RESULT=DONE\n")}
 
     @staticmethod
     def agent_pr(n, sha=HEAD, login="online-base1-factory-worker[bot]", ref="agent/2026-09-28-x", draft=True, base="main"):
@@ -90,9 +100,21 @@ class World:
         self.calls.append((method, url))
         path = url.replace("https://api.github.com", "")
         path_only = path.split("?")[0]
+        if url.startswith("https://blob.example/logs/"):
+            self.redirect_auth.append("Authorization" in headers)
+            return 200, {}, self.run_logs[int(url.rsplit("/", 1)[1])]
         if url.startswith("https://blob.example/"):
             self.redirect_auth.append("Authorization" in headers)
             return 200, {}, self.artifact_zip[int(url.rsplit("/", 1)[1])]
+        if method == "GET" and path_only == f"/repos/{REPO}/actions/workflows/reviewer.yml/runs":
+            runs = self.old_runs if "created=" in path else self.recent_runs
+            return 200, {}, json.dumps({"workflow_runs": runs}).encode()
+        m = re.fullmatch(rf"/repos/{REPO}/actions/runs/(\d+)/logs", path_only)
+        if method == "GET" and m:
+            log = self.run_logs.get(int(m.group(1)), 404)
+            if isinstance(log, int):
+                return log, {}, b"{}"
+            return 302, {"Location": f"https://blob.example/logs/{m.group(1)}"}, b""
         if method == "GET" and path_only == f"/repos/{REPO}/actions/runs/{RUN_ID}/artifacts":
             return self._page(path, {"artifacts": self.artifacts}, "artifacts")
         m = re.fullmatch(rf"/repos/{REPO}/actions/artifacts/(\d+)/zip", path_only)
@@ -143,6 +165,8 @@ class World:
             sha = FORMAT_SHA if "findings-format" in path else PROMPT_SHA
             return 200, {}, json.dumps([{"sha": sha}]).encode()
         return 599, {}, json.dumps({"unrouted": [method, path]}).encode()
+
+    # Сеть в тестах запрещена: любой вызов мимо подделки — ошибка.
 
     @staticmethod
     def _page(path, payload, key):

@@ -9,6 +9,13 @@
 # Задание канареечной заявки выкладывается тем же способом, что снимок
 # задания агента (agent-task-<sha256>), — ревьюер проверяет его тем же кодом.
 # Текст задания — константа здесь, на защищённой ветке.
+#
+# push-probe (D-106 §b, повторяемая по D-103 §a): worker-токен с
+# contents:write пытается дописать пустой коммит в canary/known-defect и
+# обязан получить GH013 от ruleset canary-protection. В паре — успешное
+# чтение той же ветки тем же токеном. Проба живёт здесь, а не в reviewer.yml:
+# ключ исполнителя в workflow ревьюера не попадает. Её провал делает прогон
+# красным, и ревьюер видит это как UNKNOWN(canary_trigger_conclusion:failure).
 name: canary-trigger
 
 on:
@@ -54,3 +61,54 @@ jobs:
           path: ${{ steps.snap.outputs.path }}
           retention-days: 14
           if-no-files-found: error
+
+  push-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Mint worker token (probe, contents:write)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Worker push to canary/known-defect is refused (GH013)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          url="https://github.com/$REPO"
+          g() { git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" "$@"; }
+          d="$(mktemp -d)"; cd "$d"
+          git init -q && git config user.name "canary push probe" && git config user.email "noreply@example.invalid"
+
+          # Положительная пара: тот же токен читает ту же ветку.
+          if ! g fetch -q --depth 1 "$url" refs/heads/canary/known-defect; then
+            echo "::error::worker token cannot fetch canary/known-defect: the refusal below would prove nothing"
+            exit 1
+          fi
+          git checkout -q FETCH_HEAD
+          before="$(git rev-parse HEAD)"
+          git commit -q --allow-empty -m "canary push probe — must be refused (D-106 §b)"
+
+          out="$(g push "$url" HEAD:refs/heads/canary/known-defect 2>&1)"; code=$?
+          echo "push exit code: $code"
+          echo "$out" | sed 's/^/  | /'
+          if [ "$code" = 0 ]; then
+            echo "::error::worker push to canary/known-defect was ACCEPTED (was $before): the canary branch is not protected; the defect can be removed without a decision"
+            exit 1
+          fi
+          if echo "$out" | grep -q "GH013" && echo "$out" | grep -q "refs/heads/canary/known-defect"; then
+            echo "push refused by a repository rule (GH013), as required; canary/known-defect stays at $before"
+          else
+            echo "::error::worker push failed, but not with GH013 for canary/known-defect (UNKNOWN): the refusal is not the ruleset"
+            exit 1
+          fi

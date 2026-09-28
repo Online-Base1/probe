@@ -15,6 +15,7 @@ D-102 (снимок задания, исходы, доступ к промпту
 гоняется на подделках (tests/test_reviewer_lib.py, tests/test_reviewer_flow.py).
 """
 
+import datetime
 import hashlib
 import io
 import json
@@ -40,13 +41,14 @@ REVIEWER_LOGIN = "online-base1-reviewer[bot]"
 AGENT_WORKFLOW_PATH = ".github/workflows/agent.yml"
 CANARY_WORKFLOW_PATH = ".github/workflows/canary-trigger.yml"
 
-# Постоянная черновая заявка canary/known-defect и служебная issue
-# «reviewer-write-probe» в factory-knowledge. Заглушки: None до их создания;
-# пока None — исход UNKNOWN(..._not_configured), ревью не делается.
-CANARY_PR = None
+# Постоянная черновая заявка canary/known-defect → canary-base (probe#34) и
+# служебная issue «reviewer-write-probe» в factory-knowledge (#3). Канарейка
+# определяется ТОЛЬКО этим номером и прогоном canary-trigger.yml (D-105 §a.1):
+# ни тело, ни ветка, ни метка заявки её не делают канарейкой.
+CANARY_PR = 34
 CANARY_BRANCH = "canary/known-defect"
 CANARY_BASE = "canary-base"  # невливаемость базой, а не меткой (D-105 §b)
-WRITE_PROBE_ISSUE = None
+WRITE_PROBE_ISSUE = 3
 
 # Известный дефект канареечной заявки (D-105 §d): lib/paginate.ts,
 # pageCount = Math.floor(total / pageSize) вместо ceil. Успех — находка,
@@ -60,6 +62,23 @@ INCOMPLETE_CONCLUSIONS = {"cancelled", "timed_out", "skipped", "startup_failure"
                           "action_required", "neutral", "stale"}
 
 DONE, INCOMPLETE, UNKNOWN_KIND, REVIEW = "DONE", "AGENT_RUN_INCOMPLETE", "UNKNOWN", "REVIEW"
+
+# Срок хранения журналов прогонов (D-107, D-108): не читается без
+# администраторского права, поэтому наблюдается. Ожидаемое значение — только
+# основа для N; в строку учёта оно не пишется, пока не наблюдено.
+EXPECTED_RETENTION_DAYS = 90
+RETENTION_MARGIN_DAYS = 7
+RETENTION_PROBE_DAYS = EXPECTED_RETENTION_DAYS - RETENTION_MARGIN_DAYS
+REVIEWER_WORKFLOW_FILE = "reviewer.yml"
+# Строка учёта в журнале; прогоны до её появления несут REVIEW_RESULT= —
+# этого достаточно, чтобы доказать, что журнал такого возраста читается.
+LEDGER_MARKERS = ("REVIEW_LEDGER ", "REVIEW_RESULT=")
+RETENTION_NOT_OBSERVED, RETENTION_FAILED = "not_observed", "failed"
+
+# Учёта прогонов (D-087, BB-22) ещё нет: единственная долговечная запись об
+# исходе канарейки — её комментарий. Ротация комментариев включается только
+# вместе с учётом (D-106 §d); пока False, ревьюер ничего не удаляет.
+LEDGER_AVAILABLE = False
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SHA1 = re.compile(r"^[0-9a-f]{40}$")
@@ -419,26 +438,75 @@ def format_comment(findings, prompt_sha, model, head_sha, run_id, trigger, forma
     return "\n".join(lines) + "\n"
 
 
-def summary_lines(result, findings_count, prompt_sha, model, canary, kind="", pr="", head_sha="", format_sha=""):
+def retention_verdict(old_run, log_status, log_text, now):
+    """Итог пробы срока по своему прогону возрастом >= N дней.
+
+    old_run None — прогона такого возраста ещё нет: not_observed, не краснеет
+    и не подменяется ожидаемым числом. Прогон есть, а журнал не отдаётся или
+    строки в нём нет — failed, красный (D-108 §b–§c).
+    """
+    if old_run is None:
+        return RETENTION_NOT_OBSERVED
+    if log_status != 200 or not any(m in (log_text or "") for m in LEDGER_MARKERS):
+        return RETENTION_FAILED
+    created = datetime.datetime.strptime(old_run["created_at"], "%Y-%m-%dT%H:%M:%SZ")
+    return f"observed={(now - created).days}d"
+
+
+def ledger_expires(run_date, retention):
+    """Дата истечения строки (D-107 §a): run_date + наблюдённая нижняя граница.
+
+    Пока срок не наблюдён — not_observed, а не run_date + 90 (D-108 §c).
+    """
+    if not retention.startswith("observed="):
+        return RETENTION_NOT_OBSERVED
+    days = int(retention[len("observed="):-1])
+    return (datetime.date.fromisoformat(run_date) + datetime.timedelta(days=days)).isoformat()
+
+
+def rotate_canary_comments(delete):
+    """Ротация канареечных комментариев — только при появившемся учёте (D-106 §d)."""
+    if not LEDGER_AVAILABLE:
+        return "disabled_until_ledger"
+    raise NotImplementedError("rotation is built together with the ledger (D-087)")
+
+
+def summary_lines(result, findings_count, prompt_sha, model, canary, kind="", pr="", head_sha="", format_sha="",
+                  run_date="", retention=RETENTION_NOT_OBSERVED):
     if findings_count is None:
         findings = "FINDINGS=n/a"
     elif findings_count == 0:
         findings = "FINDINGS=0 — находок нет"
     else:
         findings = f"FINDINGS={findings_count}"
-    # Одна строка фиксированного вида (D-106 §e): из неё учёт наполняется
-    # задним числом, пока живёт журнал прогонов. Порядок полей не меняется.
-    record = " ".join([
-        "REVIEW_RECORD",
-        f"KIND={kind or 'n/a'}",
-        f"PR={pr or 'n/a'}",
-        f"HEAD_SHA={head_sha or 'n/a'}",
-        f"RESULT={result.replace(' ', '_')}",
-        f"FINDINGS={'n/a' if findings_count is None else findings_count}",
-        f"PROMPT_SHA={prompt_sha or 'n/a'}",
-        f"FORMAT_SHA={format_sha or 'n/a'}",
-        f"MODEL={model or 'n/a'}",
-        f"CANARY={canary}",
-    ])
     return [f"REVIEW_RESULT={result}", findings, f"PROMPT_SHA={prompt_sha or 'n/a'}",
-            f"FORMAT_SHA={format_sha or 'n/a'}", f"MODEL={model or 'n/a'}", f"CANARY={canary}", record]
+            f"FORMAT_SHA={format_sha or 'n/a'}", f"MODEL={model or 'n/a'}", f"CANARY={canary}",
+            f"RETENTION={retention}",
+            ledger_line(result, findings_count, prompt_sha, model, canary, kind, pr, head_sha, format_sha,
+                        run_date, retention)]
+
+
+def ledger_line(result, findings_count, prompt_sha, model, canary, kind, pr, head_sha, format_sha,
+                run_date, retention):
+    """Одна строка учёта фиксированного вида (D-106 §e, D-107 §a) — в сводку и в журнал.
+
+    Порядок полей не меняется: из этих строк учёт наполняется задним числом.
+    d086=excluded у канарейки: она проверка инструмента и в счёт D-086 не
+    входит (D-104 §f, D-105 §c).
+    """
+    return " ".join([
+        "REVIEW_LEDGER",
+        f"kind={kind or 'n/a'}",
+        f"pr={pr or 'n/a'}",
+        f"head={head_sha or 'n/a'}",
+        f"run_date={run_date or 'n/a'}",
+        f"expires={ledger_expires(run_date, retention) if run_date else RETENTION_NOT_OBSERVED}",
+        f"retention={retention}",
+        f"result={result.replace(' ', '_')}",
+        f"findings={'n/a' if findings_count is None else findings_count}",
+        f"prompt_sha={prompt_sha or 'n/a'}",
+        f"format_sha={format_sha or 'n/a'}",
+        f"model={model or 'n/a'}",
+        f"canary={canary}",
+        f"d086={'excluded' if kind == 'canary' else 'counted'}",
+    ])

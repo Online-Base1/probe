@@ -3,6 +3,8 @@
 python3 -m unittest discover -s .github/reviewer/tests
 """
 
+import datetime
+import io
 import json
 import os
 import sys
@@ -315,9 +317,12 @@ class Review(Base):
         self.assertEqual(st["canary"], "FAIL")
 
 
+NOW = datetime.datetime(2026, 9, 29, 12, 0, 0)
+
+
 class Report(unittest.TestCase):
     def run_report(self, **env):
-        return rv.report(env)
+        return rv.report(env, now=NOW)
 
     def test_done(self):
         lines, code = self.run_report(RESOLVE_OUTCOME="REVIEW", RESOLVE_TRIGGER="agent", REVIEW_RESULT="DONE",
@@ -328,18 +333,40 @@ class Report(unittest.TestCase):
         self.assertIn("FINDINGS=0 — находок нет", lines)
         self.assertIn("CANARY=n/a", lines)
 
-    def test_record_line_fixed_form(self):
+    def test_ledger_line_fixed_form(self):
         lines, _ = self.run_report(RESOLVE_OUTCOME="REVIEW", RESOLVE_TRIGGER="agent", RESOLVE_PR="7",
                                    RESOLVE_HEAD_SHA=F.HEAD, REVIEW_RESULT="DONE", REVIEW_FINDINGS="2",
                                    REVIEW_PROMPT_SHA=F.PROMPT_SHA, REVIEW_FORMAT_SHA=F.FORMAT_SHA,
                                    REVIEW_MODEL="gpt-5.3-codex", REVIEW_CANARY="n/a")
-        self.assertEqual(lines[-1], f"REVIEW_RECORD KIND=agent PR=7 HEAD_SHA={F.HEAD} RESULT=DONE FINDINGS=2 "
-                                    f"PROMPT_SHA={F.PROMPT_SHA} FORMAT_SHA={F.FORMAT_SHA} MODEL=gpt-5.3-codex CANARY=n/a")
+        self.assertEqual(lines[-1], f"REVIEW_LEDGER kind=agent pr=7 head={F.HEAD} run_date=2026-09-29 expires=not_observed "
+                                    f"retention=not_observed result=DONE findings=2 prompt_sha={F.PROMPT_SHA} "
+                                    f"format_sha={F.FORMAT_SHA} model=gpt-5.3-codex canary=n/a d086=counted")
 
-    def test_record_line_unknown(self):
+    def test_ledger_line_unknown(self):
         lines, _ = self.run_report(RESOLVE_OUTCOME="UNKNOWN", RESOLVE_REASON="multiple_agent_prs:2", RESOLVE_TRIGGER="agent")
-        self.assertEqual(lines[-1], "REVIEW_RECORD KIND=agent PR=n/a HEAD_SHA=n/a RESULT=UNKNOWN(multiple_agent_prs:2) "
-                                    "FINDINGS=n/a PROMPT_SHA=n/a FORMAT_SHA=n/a MODEL=n/a CANARY=n/a")
+        self.assertEqual(lines[-1], "REVIEW_LEDGER kind=agent pr=n/a head=n/a run_date=2026-09-29 expires=not_observed "
+                                    "retention=not_observed result=UNKNOWN(multiple_agent_prs:2) findings=n/a prompt_sha=n/a "
+                                    "format_sha=n/a model=n/a canary=n/a d086=counted")
+
+    def test_ledger_canary_excluded_from_d086(self):
+        lines, _ = self.run_report(RESOLVE_OUTCOME="REVIEW", RESOLVE_TRIGGER="canary", REVIEW_RESULT="DONE", REVIEW_CANARY="PASS")
+        self.assertTrue(lines[-1].endswith("canary=PASS d086=excluded"))
+        self.assertIn(" kind=canary ", lines[-1])
+
+    def test_ledger_printed_to_log(self):
+        import contextlib
+        buf = io.StringIO()
+        world = F.World()
+        real = rv.GitHub
+        rv.GitHub = lambda token: real(token, transport=world.transport)
+        try:
+            with contextlib.redirect_stdout(buf):
+                rv.main(["reviewer.py", "report"])
+        finally:
+            rv.GitHub = real
+        self.assertTrue(world.calls)
+        self.assertTrue(all(u.startswith(("https://api.github.com", "https://blob.example/")) for _, u in world.calls))
+        self.assertRegex(buf.getvalue(), r"(?m)^REVIEW_LEDGER kind=")
 
     def test_incomplete_not_red(self):
         lines, code = self.run_report(RESOLVE_OUTCOME="AGENT_RUN_INCOMPLETE", RESOLVE_REASON="cancelled")
@@ -372,6 +399,91 @@ class Report(unittest.TestCase):
         lines, code = self.run_report(RESOLVE_OUTCOME="UNKNOWN", RESOLVE_REASON="no_task_artifact", RESOLVE_TRIGGER="canary")
         self.assertIn("CANARY=FAIL", lines)
         self.assertEqual(code, 1)
+
+
+class Retention(unittest.TestCase):
+    """Проба срока хранения журналов (D-107 §c, D-108)."""
+
+    def setUp(self):
+        self.w = F.World()
+
+    def probe(self):
+        return rv.retention_probe(rv.GitHub("tok", transport=self.w.transport), F.REPO, NOW, "999")
+
+    def report(self, **env):
+        base = {"RESOLVE_OUTCOME": "AGENT_RUN_INCOMPLETE", "RESOLVE_REASON": "cancelled", "REPO": F.REPO, "GITHUB_RUN_ID": "999"}
+        base.update(env)
+        return rv.report(base, gh=rv.GitHub("tok", transport=self.w.transport), now=NOW)
+
+    def test_no_old_run_not_observed_not_red(self):
+        self.w.old_runs = []
+        self.assertEqual(self.probe()[0], "not_observed")
+        lines, code = self.report()
+        self.assertEqual(code, 0)
+        self.assertIn("expires=not_observed retention=not_observed", lines[-1])
+        self.assertNotIn("90", lines[-1])
+
+    def test_old_run_log_readable_observed(self):
+        self.w.old_runs = [{"id": 501, "created_at": "2026-07-01T10:00:00Z"}]
+        self.w.run_logs[501] = F.log_zip("report\nREVIEW_LEDGER kind=agent pr=7\n")
+        self.assertEqual(self.probe()[0], "observed=90d")
+        lines, code = self.report()
+        self.assertEqual(code, 0)
+        self.assertIn("run_date=2026-09-29 expires=2026-12-28 retention=observed=90d", lines[-1])
+
+    def test_old_format_marker_accepted(self):
+        self.w.old_runs = [{"id": 501, "created_at": "2026-07-01T10:00:00Z"}]
+        self.w.run_logs[501] = F.log_zip("REVIEW_RESULT=DONE\n")
+        self.assertEqual(self.probe()[0], "observed=90d")
+
+    def test_old_log_gone_failed_red(self):
+        self.w.old_runs = [{"id": 501, "created_at": "2026-07-01T10:00:00Z"}]
+        self.w.run_logs[501] = 410
+        self.assertEqual(self.probe()[0], "failed")
+        lines, code = self.report()
+        self.assertEqual(code, 1)
+        self.assertIn("retention=failed", lines[-1])
+
+    def test_old_log_without_line_failed(self):
+        self.w.old_runs = [{"id": 501, "created_at": "2026-07-01T10:00:00Z"}]
+        self.w.run_logs[501] = F.log_zip("nothing here\n")
+        self.assertEqual(self.probe()[0], "failed")
+
+    def test_positive_control_log_unreadable_failed(self):
+        self.w.run_logs[400] = 403
+        verdict, detail = self.probe()
+        self.assertEqual(verdict, "failed")
+        self.assertIn("positive control", detail)
+
+    def test_current_run_not_used_as_positive_control(self):
+        self.w.recent_runs = [{"id": 999, "created_at": "2026-09-29T11:59:00Z"}]
+        self.w.run_logs[999] = 403
+        self.assertEqual(self.probe()[0], "not_observed")
+
+    def test_cutoff_is_n_days(self):
+        self.probe()
+        q = [u for m, u in self.w.calls if "created=" in u]
+        self.assertEqual(len(q), 1)
+        self.assertIn("created=%3C%3D2026-07-08T12:00:00Z", q[0])
+        self.assertEqual(rl.RETENTION_PROBE_DAYS, rl.EXPECTED_RETENTION_DAYS - rl.RETENTION_MARGIN_DAYS)
+
+    def test_log_redirect_drops_authorization(self):
+        self.w.old_runs = [{"id": 501, "created_at": "2026-07-01T10:00:00Z"}]
+        self.w.run_logs[501] = F.log_zip("REVIEW_LEDGER x\n")
+        self.probe()
+        self.assertTrue(self.w.redirect_auth)
+        self.assertFalse(any(self.w.redirect_auth))
+
+
+class Rotation(unittest.TestCase):
+    def test_rotation_disabled_until_ledger(self):
+        deleted = []
+        self.assertFalse(rl.LEDGER_AVAILABLE)
+        self.assertEqual(rl.rotate_canary_comments(deleted.append), "disabled_until_ledger")
+        self.assertEqual(deleted, [])
+
+    def test_constants_configured(self):
+        self.assertEqual((rl.CANARY_PR, rl.WRITE_PROBE_ISSUE), (34, 3))
 
 
 if __name__ == "__main__":
