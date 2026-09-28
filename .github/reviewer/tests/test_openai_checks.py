@@ -121,6 +121,27 @@ class Negative(unittest.TestCase):
                 self.assertEqual(oc.check_negative(default_client(per_model={oc.DENIED_MODEL: e}))[0], oc.UNKNOWN)
 
 
+class AdminApi(unittest.TestCase):
+    def test_refused(self):
+        for st in (401, 403):
+            self.assertEqual(oc.check_admin_api_refused(lambda url, st=st: st)[0], oc.PASS)
+
+    def test_reachable_is_fail(self):
+        self.assertEqual(oc.check_admin_api_refused(lambda url: 200)[0], oc.FAIL)
+
+    def test_other_is_unknown(self):
+        self.assertEqual(oc.check_admin_api_refused(lambda url: 404)[0], oc.UNKNOWN)
+        self.assertEqual(oc.check_admin_api_refused(lambda url: 500)[0], oc.UNKNOWN)
+
+    def test_no_answer_is_unknown(self):
+        def boom(url):
+            raise TimeoutError("t")
+        self.assertEqual(oc.check_admin_api_refused(boom)[0], oc.UNKNOWN)
+
+    def test_documented_endpoint(self):
+        self.assertEqual(oc.ADMIN_PROBE_URL, "https://api.openai.com/v1/organization/projects?limit=1")
+
+
 class Boundary(unittest.TestCase):
     def test_all_pass(self):
         self.assertEqual([v for _, v, _ in oc.boundary_checks(default_client(), EXPECTED)], [oc.PASS] * 3)

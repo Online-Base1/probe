@@ -14,7 +14,9 @@
 #   (б) обмен OIDC-токена GitHub на токен OpenAI успешен;
 #   (в) models.list точно равен .github/reviewer/expected-models.json;
 #   (г) responses.create на gpt-5.3-codex → completed, usage > 0;
-#   (д) responses.create на gpt-4.1-nano → только model_not_found.
+#   (д) responses.create на gpt-4.1-nano → только model_not_found;
+#   (ж) GET Admin API WIF-токеном → 401/403 (состав привязок без admin-ключа
+#       не наблюдаем; admin-ключ не заводится, D-103 §a).
 # Проверки — .github/reviewer/openai_checks.py (их же вызывает ревьюер);
 # итог PASS / FAIL / UNKNOWN, красный — всё, что не PASS. Токены не печатаются.
 name: openai-wif-test
