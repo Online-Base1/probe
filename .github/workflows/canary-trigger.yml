@@ -1,0 +1,55 @@
+# Ночная канарейка ревьюера (D-103 §c). Сам по себе ничего не делает: его
+# завершение запускает reviewer.yml по workflow_run, и ревьюер обязан найти
+# известный дефект в постоянной черновой заявке canary/known-defect
+# (CANARY_PR, CANARY_EXPECTED в .github/reviewer/reviewer_lib.py). Нет
+# находки — UNKNOWN(canary_missed), CANARY=FAIL, красный, и «чисто» этой ночи
+# не считается чистым.
+#
+# Задание канареечной заявки выкладывается тем же способом, что снимок
+# задания агента (agent-task-<sha256>), — ревьюер проверяет его тем же кодом.
+# Текст задания — константа здесь, на защищённой ветке.
+name: canary-trigger
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: canary-trigger
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Snapshot canary task
+        id: snap
+        shell: bash
+        env:
+          TASK: |-
+            Добавь в lib/percent.ts функцию percent(part: number, total: number): number —
+            долю part от total в процентах, округлённую до целого (Math.round).
+            При total <= 0, отрицательном part или нецелых аргументах бросай RangeError.
+            Добавь юнит-тесты в tests/unit/percent.test.ts.
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/agent-task"
+          mkdir -p "$d"
+          printf '%s' "$TASK" > "$d/task.txt"
+          sha="$(sha256sum "$d/task.txt" | cut -d' ' -f1)"
+          echo "artifact=agent-task-$sha" >> "$GITHUB_OUTPUT"
+          echo "path=$d/task.txt" >> "$GITHUB_OUTPUT"
+          echo "canary task snapshot: agent-task-$sha ($(wc -c < "$d/task.txt" | tr -d ' ') bytes)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload canary task snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.snap.outputs.artifact }}
+          path: ${{ steps.snap.outputs.path }}
+          retention-days: 14
+          if-no-files-found: error

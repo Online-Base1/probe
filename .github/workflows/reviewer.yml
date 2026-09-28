@@ -1,0 +1,181 @@
+# Ревьюер другого семейства (D-098, D-099, D-101, D-102, D-103).
+#
+# Запускается только с main по workflow_run прогонов agent.yml и ночной
+# канарейки canary-trigger.yml. Вывод неблокирующий: ревьюер не required
+# check, он пишет комментарий в заявку и строку REVIEW_RESULT в summary.
+#
+#   resolve — run_id только из события; ровно один артефакт agent-task-<sha256>,
+#             хеш его байтов == суффиксу; заявка агента — ровно одна по автору,
+#             ветке agent/* и окну прогона (не расширяется); для канарейки —
+#             номер константой. Незавершённый прогон агента —
+#             AGENT_RUN_INCOMPLETE(<conclusion>), не UNKNOWN.
+#   review  — отказы в каждом прогоне, fail closed: (п1) токен factory-knowledge
+#             не комментирует там, (п2) токен probe не одобряет канареечную
+#             заявку; сверка OpenAI (openai_checks.py): список моделей,
+#             успех gpt-5.3-codex, model_not_found для gpt-4.1-nano. Затем
+#             промпт и схема с main factory-knowledge, запрос по белому списку
+#             (задание, дифф, статусы гейтов — без body, title и сообщений
+#             коммитов), ответ по схеме, usage > 0, комментарий с маркером head_sha.
+#   report  — REVIEW_RESULT=DONE|AGENT_RUN_INCOMPLETE(..)|UNKNOWN(..), FINDINGS,
+#             PROMPT_SHA, MODEL, CANARY; UNKNOWN и CANARY=FAIL — красный.
+#
+# Логика — .github/reviewer/reviewer.py и reviewer_lib.py; тесты без сети —
+# .github/reviewer/tests/. Токены не печатаются.
+#
+# Заглушки до появления приложения online-base1-reviewer и привязки
+# Reviewer-Run: vars.FACTORY_REVIEWER_APP_CLIENT_ID,
+# secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY, vars.OPENAI_REVIEWER_SERVICE_ACCOUNT_ID,
+# константы CANARY_PR и WRITE_PROBE_ISSUE в reviewer_lib.py. Пока их нет,
+# прогон красный — так и должно быть.
+name: reviewer
+
+on:
+  workflow_run:
+    workflows: [agent, canary-trigger]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      outcome: ${{ steps.resolve.outputs.outcome }}
+      reason: ${{ steps.resolve.outputs.reason }}
+      trigger: ${{ steps.resolve.outputs.trigger }}
+      pr: ${{ steps.resolve.outputs.pr }}
+      head_sha: ${{ steps.resolve.outputs.head_sha }}
+      run_id: ${{ steps.resolve.outputs.run_id }}
+    steps:
+      - name: Checkout reviewer code (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/reviewer/
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve run, task snapshot and pull request
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN_READ: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: python3 .github/reviewer/reviewer.py resolve
+
+  review:
+    needs: resolve
+    if: needs.resolve.outputs.outcome == 'REVIEW'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Одно ревью на пару (заявка, head_sha); повтор не отменяет идущее.
+    concurrency:
+      group: review-${{ needs.resolve.outputs.pr }}-${{ needs.resolve.outputs.head_sha }}
+      cancel-in-progress: false
+    permissions:
+      id-token: write
+      actions: read
+      contents: read
+      pull-requests: read
+      checks: read
+      statuses: read
+    outputs:
+      result: ${{ steps.review.outputs.result }}
+      findings: ${{ steps.review.outputs.findings }}
+      prompt_sha: ${{ steps.review.outputs.prompt_sha }}
+      model: ${{ steps.review.outputs.model }}
+      canary: ${{ steps.review.outputs.canary }}
+    steps:
+      - name: Checkout reviewer code (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/reviewer/
+            .github/workflows/openai-wif-test.requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Install openai SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary=:all: \
+            -r .github/workflows/openai-wif-test.requirements.txt
+
+      # Два узких токена приложения ревьюера (D-103 §e): на factory-knowledge —
+      # только contents:read (комментировать и одобрять там нечем), на probe —
+      # issues:write для комментария и pull-requests:read. Область называется
+      # при выпуске; пробы ниже проверяют её отказом в каждом прогоне.
+      - name: Mint reviewer token (factory-knowledge, contents:read)
+        id: fk
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: factory-knowledge
+          permission-contents: read
+
+      - name: Mint reviewer token (probe, issues:write, pull-requests:read)
+        id: pr
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+          permission-pull-requests: read
+
+      - name: Review
+        id: review
+        shell: bash
+        env:
+          GH_TOKEN_READ: ${{ github.token }}
+          GH_TOKEN_KNOWLEDGE: ${{ steps.fk.outputs.token }}
+          GH_TOKEN_PROBE: ${{ steps.pr.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ needs.resolve.outputs.pr }}
+          HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
+          RUN_ID: ${{ needs.resolve.outputs.run_id }}
+          TRIGGER: ${{ needs.resolve.outputs.trigger }}
+          OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.OPENAI_IDENTITY_PROVIDER_ID }}
+          OPENAI_REVIEWER_SERVICE_ACCOUNT_ID: ${{ vars.OPENAI_REVIEWER_SERVICE_ACCOUNT_ID }}
+          OPENAI_WIF_AUDIENCE: ${{ vars.OPENAI_WIF_AUDIENCE }}
+        run: /tmp/venv/bin/python .github/reviewer/reviewer.py review
+
+  report:
+    needs: [resolve, review]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout reviewer code (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/reviewer/
+          sparse-checkout-cone-mode: false
+
+      - name: REVIEW_RESULT
+        shell: bash
+        env:
+          RESOLVE_JOB_RESULT: ${{ needs.resolve.result }}
+          RESOLVE_OUTCOME: ${{ needs.resolve.outputs.outcome }}
+          RESOLVE_REASON: ${{ needs.resolve.outputs.reason }}
+          RESOLVE_TRIGGER: ${{ needs.resolve.outputs.trigger }}
+          REVIEW_JOB_RESULT: ${{ needs.review.result }}
+          REVIEW_RESULT: ${{ needs.review.outputs.result }}
+          REVIEW_FINDINGS: ${{ needs.review.outputs.findings }}
+          REVIEW_PROMPT_SHA: ${{ needs.review.outputs.prompt_sha }}
+          REVIEW_MODEL: ${{ needs.review.outputs.model }}
+          REVIEW_CANARY: ${{ needs.review.outputs.canary }}
+        run: python3 .github/reviewer/reviewer.py report
