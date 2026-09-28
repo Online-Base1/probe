@@ -48,3 +48,5 @@ npm run test:e2e
 ```bash
 npm run lint
 ```
+
+Самопроверка canary_skip: 2026-09-28
