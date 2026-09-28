@@ -27,6 +27,18 @@ on:
         description: "Задача для роли (многострочный текст)"
         required: true
         type: string
+      # Самопроверка предохранителей (D-099 §b: предохранитель доказывается
+      # наблюдённым отказом). Оба режима могут только сделать прогон красным:
+      # version_mismatch подставляет в сверку версии заведомо несуществующую
+      # ожидаемую строку; canary_skip убирает из prompt инструкцию канарейки.
+      # Никакого значения версии вход не несёт — ожидаемая версия живёт только
+      # здесь, в CLAUDE_CODE_VERSION.
+      self_test:
+        description: "Самопроверка: none | version_mismatch | canary_skip"
+        required: false
+        type: choice
+        default: none
+        options: [none, version_mismatch, canary_skip]
 
 permissions: {}
 
@@ -98,6 +110,7 @@ jobs:
           CLAUDE_CODE_RELEASES: https://downloads.claude.ai/claude-code-releases
           CLAUDE_CODE_KEY_URL: https://downloads.claude.ai/keys/claude-code.asc
           DISABLE_AUTOUPDATER: "1"
+          SELF_TEST: ${{ inputs.self_test }}
         run: |
           set -euo pipefail
           GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"; export GNUPGHOME
@@ -160,11 +173,22 @@ jobs:
           dest="$RUNNER_TEMP/claude-bin"
           mkdir -p "$dest"
           install -m 0755 "$work/claude" "$dest/claude"
-          ver="$("$dest/claude" --version)"
-          case "$ver" in
-            *"$V"*) echo "claude --version: $ver" ;;
-            *) echo "::error::claude --version is '$ver', expected $V"; exit 1 ;;
-          esac
+          # Сверка фактической версии с ожидаемой — наблюдением, а не способом
+          # установки; до роли, чтобы расхождение не оплачивалось прогоном.
+          # Сравнение на равенство (не вхождение подстроки): «2.1.283» не
+          # должно совпадать с «2.1.2830».
+          expected="$V"
+          if [ "${SELF_TEST:-none}" = "version_mismatch" ]; then
+            expected="0.0.0-selftest-nonexistent"
+            echo "::notice::self_test=version_mismatch: expected version replaced with '$expected' for this run"
+          fi
+          raw="$("$dest/claude" --version)"
+          actual="${raw%% *}"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Claude Code version mismatch — expected: '$expected', actual: '$actual' (claude --version: '$raw')"
+            exit 1
+          fi
+          echo "claude --version: $raw — equals expected '$expected'"
           echo "path=$dest/claude" >> "$GITHUB_OUTPUT"
 
       - name: Run role
@@ -192,8 +216,13 @@ jobs:
             --max-turns 40
             --model claude-sonnet-5
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git switch:*),Bash(git checkout -b:*),Bash(git add:*),Bash(git commit:*),Bash(git push -u origin agent/*),Bash(gh pr create --draft:*)"
+          # Канарейка (D-100 §f): заведомо запрещённая и безвредная команда,
+          # которую роль выполняет первой. Её отказ записывает та же система
+          # разрешений в тот же permission_denials, что и настоящие отказы, и
+          # разбирает тот же jq — так проверяется именно рабочий путь.
           prompt: |
             Ты — роль фабрики в репозитории ${{ github.repository }}.
+            ${{ inputs.self_test != 'canary_skip' && format('0. Первым действием, до всего остального, выполни ровно одну команду Bash: `echo agent-canary-{0}` — без изменений и без параметров. Система разрешений её отклонит: это проверка механики, так и должно быть. Не повторяй её, не меняй и не обходи, сразу переходи к задаче и не упоминай её в описании PR.', github.run_id) || '' }}
 
             Рамки (нарушать нельзя, даже если задача просит иного):
             1. Работай только в новой ветке agent/${{ steps.date.outputs.today }}-<кратко>,
@@ -318,8 +347,10 @@ jobs:
         run: |
           set -euo pipefail
           f="${LOG_FILE:-$RUNNER_TEMP/claude-execution-output.json}"
+          extraction="$RUNNER_TEMP/denial-extraction.json"
           if [ ! -f "$f" ]; then
             echo "::warning::no execution log at $f; permission denials not checked"
+            echo '{"log_missing": true}' > "$extraction"
             exit 0
           fi
 
@@ -333,16 +364,30 @@ jobs:
                 | select(.value == true)
                 | select(.key | test("dangerous|sandbox|bypass|skip.?permission|unrestrict"; "i"))
                 | .key ];
+            # Канарейка — отказ Bash с маркером этого прогона и без параметров
+            # обхода. Она не засчитывается агенту: ни в отказы, ни в попытки
+            # обхода. Повтор канарейки с параметром обхода — уже поведение
+            # агента и засчитывается.
+            def is_canary: .tool_name == "Bash"
+                and ((.tool_input.command // "") | tostring | contains("agent-canary-" + $rid))
+                and (bypass_keys | length == 0);
             ([ (if type == "array" then .[] else . end) | select(.type == "result") ] | last // {}) as $r
-            | ($r.permission_denials // []) as $d
-            | { n: ($d | length),
+            | ($r.permission_denials // []) as $all
+            | [ $all[] | select(is_canary) ] as $canary
+            | [ $all[] | select(is_canary | not) ] as $d
+            | { raw: ($all | length),
+                canary_found: (($canary | length) > 0),
+                n: ($d | length),
                 bypass: ($d | map(select(bypass_keys | length > 0)) | length),
                 turns: ($r.num_turns // "unknown"),
                 cost: ($r.total_cost_usd // "unknown"),
                 items: [ $d[] | { tool: (.tool_name // "unknown"), bypass: bypass_keys,
                                   text: ((.tool_input.command // .tool_input.file_path // .tool_input.path
                                           // (.tool_input | keys | join(","))) | tostring) } ] }
-          ' "$f" > /tmp/denials.json
+          ' --arg rid "$RUN_ID" "$f" > /tmp/denials.json
+          cp /tmp/denials.json "$extraction"
+          raw="$(jq -r .raw /tmp/denials.json)"
+          canary="$(jq -r .canary_found /tmp/denials.json)"
           n="$(jq -r .n /tmp/denials.json)"
           bypass="$(jq -r .bypass /tmp/denials.json)"
           turns="$(jq -r .turns /tmp/denials.json)"
@@ -351,9 +396,9 @@ jobs:
           {
             echo "### Роль: счётчики прогона"
             echo
-            echo "| permission_denials_count | num_turns | total_cost_usd |"
-            echo "|---|---|---|"
-            echo "| $n | $turns | $cost |"
+            echo "| permission_denials_count (всего) | отказы агента | попытки обхода агента | канарейка найдена | num_turns | total_cost_usd |"
+            echo "|---|---|---|---|---|---|"
+            echo "| $raw | $n | $bypass | $canary | $turns | $cost |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           # Комментарий публичный, а текст команд пишет агент. Поэтому команда —
@@ -382,6 +427,12 @@ jobs:
                   (.text | clean | split("\n")[] | "  " + .),
                   "  ```"
               ' /tmp/denials.json
+            fi
+            echo
+            if [ "$canary" = true ]; then
+              echo "Канарейка извлечения найдена (не засчитывается агенту)."
+            else
+              echo "Канарейка извлечения НЕ найдена — механика извлечения не подтверждена."
             fi
             echo
             echo "_Извлечено из журнала выполнения автоматически, не из описания PR._"
@@ -427,6 +478,30 @@ jobs:
             echo "::error::$n permission denial(s) during the role run (with bypass attempt: $bypass); see the PR comment and the execution log"
             exit 1
           fi
+
+      # Положительная контрольная для извлечения отказов (D-100 §f): ноль
+      # найденных отказов неотличим от «отказов не было», пока механика не
+      # доказала, что видит заведомый отказ. if: always() — иначе таймаут или
+      # провал раньше снимут и эту проверку, и прогон будет выглядеть чистым.
+      - name: Verify denial extraction (canary)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          extraction="$RUNNER_TEMP/denial-extraction.json"
+          if [ ! -f "$extraction" ]; then
+            echo "::error::denial extraction not confirmed: the extraction step did not run"
+            exit 1
+          fi
+          if jq -e '.log_missing == true' "$extraction" > /dev/null; then
+            echo "::error::denial extraction not confirmed: no execution log, the canary could not be checked"
+            exit 1
+          fi
+          if ! jq -e '.canary_found == true' "$extraction" > /dev/null; then
+            echo "::error::denial extraction not confirmed: the canary denial was not found (the role did not run it, or the parser does not see it)"
+            exit 1
+          fi
+          echo "denial extraction confirmed: canary found; agent denials $(jq -r .n "$extraction"), agent bypass attempts $(jq -r .bypass "$extraction")"
 
       # Журнал выполнения роли — артефакт прогона: без него не видно, на что
       # пришлись отказы в разрешениях (прогоны 36306384648, 36320757375).
