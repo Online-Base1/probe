@@ -1,5 +1,5 @@
-# Проверка федерации OIDC к OpenAI API для ревьюера другого семейства
-# (BB-21a, D-091: ключ — только при отказе федерации). Образец —
+# Проверка федерации OIDC к OpenAI API и allowlist моделей ревьюера другого
+# семейства (BB-21a, D-091, D-098, D-099, D-101). Образец —
 # anthropic-wif-test.yml. Долгоживущего ключа OpenAI в контуре нет.
 #
 # Mapping в OpenAI совпадает только с repository_id 1359735765,
@@ -8,13 +8,15 @@
 # ветки должен получить отказ ОБМЕНА от самого OpenAI — это отрицательная
 # проверка федерации.
 #
+# Граница — allowlist моделей проекта, а не Restricted-права: для WIF-токенов
+# права не применяются (rerun 2026-09-28), поэтому проба embeddings убрана.
 #   (а) ключей OPENAI_API_KEY / ANTHROPIC_API_KEY в окружении нет;
 #   (б) обмен OIDC-токена GitHub на токен OpenAI успешен;
-#   (в) models.list — ответ получен, печатается число моделей;
-#   (г) один минимальный responses.create (max_output_tokens 16) — ответ получен;
-#   (д) /v1/embeddings — отказ 401/403: у service account права Restricted
-#       (List models Read, Responses Write).
-# Итог — failure при любом несовпадении. Токены не печатаются.
+#   (в) models.list точно равен .github/reviewer/expected-models.json;
+#   (г) responses.create на gpt-5.3-codex → completed, usage > 0;
+#   (д) responses.create на gpt-4.1-nano → только model_not_found.
+# Проверки — .github/reviewer/openai_checks.py (их же вызывает ревьюер);
+# итог PASS / FAIL / UNKNOWN, красный — всё, что не PASS. Токены не печатаются.
 name: openai-wif-test
 
 on:
@@ -34,13 +36,15 @@ jobs:
       id-token: write
       contents: read
     steps:
-      # Нужен только файл требований с хешами; учётные данные в git не
-      # сохраняются.
-      - name: Checkout requirements
+      # Нужны только файл требований с хешами и .github/reviewer; учётные
+      # данные в git не сохраняются.
+      - name: Checkout requirements and checks
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github/workflows/openai-wif-test.requirements.txt
+          sparse-checkout: |
+            .github/workflows/openai-wif-test.requirements.txt
+            .github/reviewer/
           sparse-checkout-cone-mode: false
 
       - name: Install openai SDK
@@ -54,6 +58,12 @@ jobs:
             --require-hashes --only-binary=:all: \
             -r .github/workflows/openai-wif-test.requirements.txt
 
+      # Логика проверок на подделках, без сети: если она сломана, до обмена
+      # дело не доходит.
+      - name: Unit tests of the checks (offline)
+        shell: bash
+        run: /tmp/venv/bin/python -m unittest discover -s .github/reviewer/tests -v
+
       - name: Federated checks against OpenAI
         shell: bash
         env:
@@ -61,111 +71,4 @@ jobs:
           OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.OPENAI_SERVICE_ACCOUNT_ID }}
           OPENAI_WIF_AUDIENCE: ${{ vars.OPENAI_WIF_AUDIENCE }}
           REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          /tmp/venv/bin/python - <<'PY'
-          import json
-          import os
-          import re
-          import sys
-          import urllib.parse
-          import urllib.request
-
-          from openai import OpenAI
-          from openai.auth import WorkloadIdentityAuth
-
-          results = {}
-
-          def scrub(text):
-              # Токены, JWT и заголовки не печатаются, даже если сервер их вернул.
-              text = re.sub(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*", "<jwt>", str(text))
-              text = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "<key>", text)
-              text = re.sub(r"(?i)bearer\s+\S+", "Bearer <redacted>", text)
-              return " ".join(text.split())[:500]
-
-          def describe(exc):
-              status = getattr(exc, "status_code", None)
-              body = getattr(exc, "body", None)
-              return f"{type(exc).__name__} status={status} body={scrub(json.dumps(body, ensure_ascii=False) if body is not None else '')}"
-
-          def verdict(name, ok, detail):
-              results[name] = ok
-              print(f"{name}: {'PASS' if ok else 'FAIL'} — {detail}")
-
-          print(f"ref={os.environ['REF']}")
-
-          # (а) статических ключей в окружении нет
-          present = [n for n in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_ADMIN_KEY") if n in os.environ]
-          verdict("(а) no static keys in env", not present, "present: " + (", ".join(present) or "none"))
-
-          for n in ("OPENAI_IDENTITY_PROVIDER_ID", "OPENAI_SERVICE_ACCOUNT_ID", "OPENAI_WIF_AUDIENCE"):
-              if not os.environ.get(n):
-                  print(f"::error::repository variable {n} is empty")
-                  sys.exit(1)
-
-          def github_oidc_token():
-              # OIDC-токен GitHub с audience из переменной; значение не печатается.
-              url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + urllib.parse.quote(os.environ["OPENAI_WIF_AUDIENCE"], safe="")
-              req = urllib.request.Request(url, headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
-              with urllib.request.urlopen(req, timeout=10) as resp:
-                  value = json.load(resp).get("value", "")
-              if not value:
-                  raise RuntimeError("GitHub did not issue an OIDC token")
-              return value
-
-          wi = {
-              "identity_provider_id": os.environ["OPENAI_IDENTITY_PROVIDER_ID"],
-              "service_account_id": os.environ["OPENAI_SERVICE_ACCOUNT_ID"],
-              "provider": {"token_type": "jwt", "get_token": github_oidc_token},
-          }
-
-          # (б) обмен — отдельно от вызовов API, чтобы отказ обмена не путался
-          # с отказом по правам.
-          try:
-              token = WorkloadIdentityAuth(workload_identity=wi).get_token()
-              verdict("(б) token exchange", bool(token), "access token received (not printed)")
-              del token
-          except Exception as exc:
-              verdict("(б) token exchange", False, describe(exc))
-
-          if results["(б) token exchange"]:
-              client = OpenAI(workload_identity=wi)
-
-              # (в) список моделей
-              ids = []
-              try:
-                  ids = [m.id for m in client.models.list()]
-                  verdict("(в) models.list", len(ids) > 0, f"{len(ids)} models")
-              except Exception as exc:
-                  verdict("(в) models.list", False, describe(exc))
-
-              # (г) один минимальный ответ дешёвой моделью из списка
-              cheap = [m for m in ("gpt-4.1-nano", "gpt-4o-mini", "gpt-4.1-mini", "gpt-5-nano", "gpt-5-mini") if m in ids]
-              if not cheap:
-                  verdict("(г) responses.create", False, "no cheap model from the preference list in models.list")
-              else:
-                  try:
-                      r = client.responses.create(model=cheap[0], input="Reply with the single word: ok", max_output_tokens=16)
-                      usage = getattr(r, "usage", None)
-                      verdict("(г) responses.create", bool(r.id) and r.status in ("completed", "incomplete"),
-                              f"model={cheap[0]} status={r.status} input_tokens={getattr(usage, 'input_tokens', None)} output_tokens={getattr(usage, 'output_tokens', None)}")
-                  except Exception as exc:
-                      verdict("(г) responses.create", False, describe(exc))
-
-              # (д) за пределами прав — отказ 401/403
-              try:
-                  client.embeddings.create(model="text-embedding-3-small", input="x")
-                  verdict("(д) embeddings refused", False, "embeddings request SUCCEEDED — service account is not restricted")
-              except Exception as exc:
-                  status = getattr(exc, "status_code", None)
-                  verdict("(д) embeddings refused", status in (401, 403), describe(exc))
-          else:
-              for name in ("(в) models.list", "(г) responses.create", "(д) embeddings refused"):
-                  verdict(name, False, "not run: token exchange failed")
-
-          failed = [n for n, ok in results.items() if not ok]
-          if failed:
-              print("::error::failed: " + ", ".join(failed))
-              sys.exit(1)
-          print("openai federation: all checks PASS")
-          PY
+        run: /tmp/venv/bin/python .github/reviewer/openai_smoke.py
