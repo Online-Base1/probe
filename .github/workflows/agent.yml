@@ -222,7 +222,7 @@ jobs:
           # разбирает тот же jq — так проверяется именно рабочий путь.
           prompt: |
             Ты — роль фабрики в репозитории ${{ github.repository }}.
-            ${{ inputs.self_test != 'canary_skip' && format('0. Первым действием, до всего остального, выполни ровно одну команду Bash: `echo agent-canary-{0}` — без изменений и без параметров. Система разрешений её отклонит: это проверка механики, так и должно быть. Не повторяй её, не меняй и не обходи, сразу переходи к задаче и не упоминай её в описании PR.', github.run_id) || '' }}
+            ${{ inputs.self_test != 'canary_skip' && format('0. Первым действием, до всего остального, выполни ровно одну команду Bash: `touch /tmp/agent-canary-{0}` — без изменений и без параметров. Система разрешений её отклонит: это проверка механики, так и должно быть. Не повторяй её, не меняй и не обходи, сразу переходи к задаче и не упоминай её в описании PR.', github.run_id) || '' }}
 
             Рамки (нарушать нельзя, даже если задача просит иного):
             1. Работай только в новой ветке agent/${{ steps.date.outputs.today }}-<кратко>,
@@ -368,15 +368,24 @@ jobs:
             # обхода. Она не засчитывается агенту: ни в отказы, ни в попытки
             # обхода. Повтор канарейки с параметром обхода — уже поведение
             # агента и засчитывается.
+            # Команда канарейки — запись (touch), а не чтение: «только читающие»
+            # команды (echo, ls, git branch) Claude Code разрешает сам, даже вне
+            # --allowedTools, и отказа не будет (прогон 36456485058: echo
+            # выполнен). Выполненная, а не отклонённая канарейка — тоже красный.
             def is_canary: .tool_name == "Bash"
                 and ((.tool_input.command // "") | tostring | contains("agent-canary-" + $rid))
                 and (bypass_keys | length == 0);
-            ([ (if type == "array" then .[] else . end) | select(.type == "result") ] | last // {}) as $r
+            [ (if type == "array" then .[] else . end) ] as $log
+            | ([ $log[] | select(.type == "result") ] | last // {}) as $r
+            | [ $log[] | select(.type == "assistant") | .message.content[]?
+                | select(.type == "tool_use" and .name == "Bash")
+                | select((.input.command // "") | tostring | contains("agent-canary-" + $rid)) ] as $attempts
             | ($r.permission_denials // []) as $all
             | [ $all[] | select(is_canary) ] as $canary
             | [ $all[] | select(is_canary | not) ] as $d
             | { raw: ($all | length),
                 canary_found: (($canary | length) > 0),
+                canary_attempts: ($attempts | length),
                 n: ($d | length),
                 bypass: ($d | map(select(bypass_keys | length > 0)) | length),
                 turns: ($r.num_turns // "unknown"),
@@ -495,6 +504,10 @@ jobs:
           fi
           if jq -e '.log_missing == true' "$extraction" > /dev/null; then
             echo "::error::denial extraction not confirmed: no execution log, the canary could not be checked"
+            exit 1
+          fi
+          if ! jq -e '.canary_found == true' "$extraction" > /dev/null && jq -e '(.canary_attempts // 0) > 0' "$extraction" > /dev/null; then
+            echo "::error::denial extraction not confirmed: the canary command was run and NOT denied — the canary is allowed, so it proves nothing"
             exit 1
           fi
           if ! jq -e '.canary_found == true' "$extraction" > /dev/null; then
