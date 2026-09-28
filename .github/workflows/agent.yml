@@ -11,9 +11,13 @@
 # Ключ модели не используется: только федерация OIDC. Правило федерации
 # совпадает лишь с refs/heads/main, поэтому запуск с другой ветки отказывает.
 #
-# Блокер для schedule: установщик Claude Code не прибит (curl | bash внутри
-# action). До расписания — своя установка CLI по версии с проверкой
-# контрольной суммы.
+# Claude Code CLI ставится своим шагом: бинарник по точной версии, подпись
+# манифеста релиза (GPG, отпечаток ключа прибит) и sha256 с размером из него.
+# Установщик action (curl | bash) не используется.
+# Версию CLI поднимать только вместе с SHA claude-code-action, одной заявкой.
+#
+# Известное ограничение: ручная отмена прогона и зависание вне роли
+# пропускают Verify envelope (вариант 2 — отдельный job — в запасе).
 name: agent
 
 on:
@@ -77,10 +81,95 @@ jobs:
         shell: bash
         run: echo "today=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
+      # CLI — из опубликованного Anthropic релиза с проверкой цепочки:
+      # отпечаток ключа (константа) → подпись manifest.json → sha256 и размер
+      # бинарника из манифеста. Любое расхождение — отказ до запуска роли.
+      # https://code.claude.com/docs/en/setup#binary-integrity-and-code-signing
+      - name: Install Claude Code (verified)
+        id: claude_cli
+        shell: bash
+        env:
+          CLAUDE_CODE_VERSION: "2.1.283" # = версия, зашитая в claude-code-action 756cc22
+          CLAUDE_CODE_KEY_FPR: 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+          CLAUDE_CODE_PLATFORM: linux-x64
+          CLAUDE_CODE_RELEASES: https://downloads.claude.ai/claude-code-releases
+          CLAUDE_CODE_KEY_URL: https://downloads.claude.ai/keys/claude-code.asc
+          DISABLE_AUTOUPDATER: "1"
+        run: |
+          set -euo pipefail
+          GNUPGHOME="$(mktemp -d)"; chmod 700 "$GNUPGHOME"; export GNUPGHOME
+          work="$(mktemp -d)"
+          trap 'rm -rf "$GNUPGHOME" "$work"' EXIT
+          V="$CLAUDE_CODE_VERSION"; P="$CLAUDE_CODE_PLATFORM"
+
+          # 1. Ключ: ровно один первичный ключ с прибитым отпечатком.
+          curl -fsSL "$CLAUDE_CODE_KEY_URL" -o "$work/key.asc"
+          gpg --batch --quiet --import "$work/key.asc"
+          fprs="$(gpg --batch --with-colons --list-keys | awk -F: '$1=="pub"{p=1; next} $1=="fpr" && p{print $10; p=0}')"
+          if [ "$fprs" != "$CLAUDE_CODE_KEY_FPR" ]; then
+            echo "::error::release key fingerprint mismatch: got [$(echo $fprs)], expected $CLAUDE_CODE_KEY_FPR"
+            exit 1
+          fi
+          echo "release key fingerprint OK: $CLAUDE_CODE_KEY_FPR"
+
+          # 2. Манифест и его подпись; подпись обязана быть от прибитого ключа.
+          curl -fsSL "$CLAUDE_CODE_RELEASES/$V/manifest.json" -o "$work/manifest.json"
+          curl -fsSL "$CLAUDE_CODE_RELEASES/$V/manifest.json.sig" -o "$work/manifest.json.sig"
+          if ! gpg --batch --status-fd 1 --verify "$work/manifest.json.sig" "$work/manifest.json" > "$work/verify.out" 2> "$work/verify.err"; then
+            echo "::error::manifest signature verification failed for $V"
+            grep -E "BAD|NO_PUBKEY|ERRSIG|BADSIG" "$work/verify.out" "$work/verify.err" | sed 's/^/  /' || true
+            exit 1
+          fi
+          if ! grep -qE "^\[GNUPG:\] VALIDSIG .* $CLAUDE_CODE_KEY_FPR\$" "$work/verify.out"; then
+            echo "::error::manifest is not signed by $CLAUDE_CODE_KEY_FPR"
+            exit 1
+          fi
+          echo "manifest signature OK ($V)"
+
+          # 3. Ожидаемые sha256 и размер — только из подписанного манифеста.
+          mv_version="$(jq -r .version "$work/manifest.json")"
+          [ "$mv_version" = "$V" ] || { echo "::error::manifest version $mv_version != $V"; exit 1; }
+          want_sha="$(jq -r --arg p "$P" '.platforms[$p].checksum // empty' "$work/manifest.json")"
+          want_size="$(jq -r --arg p "$P" '.platforms[$p].size // empty' "$work/manifest.json")"
+          bin_name="$(jq -r --arg p "$P" '.platforms[$p].binary // "claude"' "$work/manifest.json")"
+          if ! [[ "$want_sha" =~ ^[0-9a-f]{64}$ ]] || ! [[ "$want_size" =~ ^[0-9]+$ ]]; then
+            echo "::error::manifest has no valid checksum/size for $P"
+            exit 1
+          fi
+          echo "sdkCompat: $(jq -c '.sdkCompat // null' "$work/manifest.json")"
+
+          # 4. Бинарник: размер и sha256 обязаны совпасть с манифестом.
+          curl -fsSL "$CLAUDE_CODE_RELEASES/$V/$P/$bin_name" -o "$work/claude"
+          got_size="$(wc -c < "$work/claude" | tr -d ' ')"
+          got_sha="$(sha256sum "$work/claude" | cut -d' ' -f1)"
+          if [ "$got_size" != "$want_size" ] || [ "$got_sha" != "$want_sha" ]; then
+            echo "::error::binary does not match the signed manifest ($P): size $got_size/$want_size, sha256 $got_sha/$want_sha"
+            exit 1
+          fi
+          echo "binary sha256 and size OK ($P, $got_size bytes)"
+
+          # 5. Установка и проверка версии.
+          dest="$RUNNER_TEMP/claude-bin"
+          mkdir -p "$dest"
+          install -m 0755 "$work/claude" "$dest/claude"
+          ver="$("$dest/claude" --version)"
+          case "$ver" in
+            *"$V"*) echo "claude --version: $ver" ;;
+            *) echo "::error::claude --version is '$ver', expected $V"; exit 1 ;;
+          esac
+          echo "path=$dest/claude" >> "$GITHUB_OUTPUT"
+
       - name: Run role
         id: role
+        # Таймаут шага меньше таймаута job: при срабатывании шаг проваливается,
+        # а не отменяется, и шаги с !cancelled()/always() (Verify envelope,
+        # отказы, журнал) успевают выполниться.
+        timeout-minutes: 20
         uses: anthropics/claude-code-action@756cc22e19660d20e8cc9496b4f242475a7f7790 # v1.0.235
+        env:
+          DISABLE_AUTOUPDATER: "1"
         with:
+          path_to_claude_code_executable: ${{ steps.claude_cli.outputs.path }}
           github_token: ${{ steps.app.outputs.token }}
           # Автор коммитов — бот приложения, а не claude[bot] по умолчанию
           # (id 41898282 принадлежит github-actions[bot]). ID пользователя-бота
