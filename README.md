@@ -1,5 +1,7 @@
 # Шаблон next-app
 
+Дата сборки: 2026-09-28
+
 Веб-приложение с базой данных. Next.js (App Router) + Prisma + Vitest +
 Playwright.
 
