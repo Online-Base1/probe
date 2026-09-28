@@ -116,6 +116,29 @@ def check_negative(client, model=DENIED_MODEL):
     return FAIL, f"model={model} request SUCCEEDED — model is not blocked by the allowlist"
 
 
+# Документированный эндпоинт Admin API; путей для перечисления WIF-провайдеров
+# и привязок в документации нет, поэтому их не подбираем.
+ADMIN_PROBE_URL = "https://api.openai.com/v1/organization/projects?limit=1"
+
+
+def check_admin_api_refused(http_get):
+    """(ж) Admin API недоступен WIF-токену (привязки не содержат Admin-scope).
+
+    http_get(url) -> HTTP-статус; токен остаётся внутри http_get.
+    401/403 — PASS: состав привязок через WIF не перечислить, нужен admin-ключ,
+    которого нет и не будет. 2xx — FAIL: федеративный токен достаёт до Admin API.
+    """
+    try:
+        status = http_get(ADMIN_PROBE_URL)
+    except Exception as exc:
+        return UNKNOWN, "no answer: " + describe(exc)
+    if status in (401, 403):
+        return PASS, f"GET /v1/organization/projects -> {status}: Admin API is not reachable with the WIF token"
+    if 200 <= status < 300:
+        return FAIL, f"GET /v1/organization/projects -> {status}: the WIF token reaches the Admin API"
+    return UNKNOWN, f"GET /v1/organization/projects -> {status}"
+
+
 def boundary_checks(client, expected):
     """(в), (г), (д) по порядку; результат — список (имя, итог, подробность)."""
     return [

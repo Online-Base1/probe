@@ -2,7 +2,8 @@
 
   (а) ключей OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENAI_ADMIN_KEY в окружении нет;
   (б) обмен OIDC-токена GitHub на токен OpenAI успешен;
-  (в)–(д) — openai_checks.boundary_checks.
+  (в)–(д) — openai_checks.boundary_checks;
+  (ж) Admin API отклоняет WIF-токен (перечислить привязки без admin-ключа нельзя).
 
 Любой итог, кроме PASS, — выход 1. Токены не печатаются.
 """
@@ -10,6 +11,7 @@
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -36,6 +38,26 @@ def workload_identity():
         "service_account_id": os.environ["OPENAI_SERVICE_ACCOUNT_ID"],
         "provider": {"token_type": "jwt", "get_token": github_oidc_token},
     }
+
+
+def admin_get_status(wi):
+    """GET к Admin API WIF-токеном; возвращается только HTTP-статус."""
+    from openai.auth import WorkloadIdentityAuth
+
+    token = WorkloadIdentityAuth(workload_identity=wi).get_token()
+
+    def http_get(url):
+        req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    try:
+        return oc.check_admin_api_refused(http_get)
+    finally:
+        del token
 
 
 def main():
@@ -75,8 +97,9 @@ def main():
     if exchanged:
         for name, verdict, detail in oc.boundary_checks(OpenAI(workload_identity=wi), expected):
             record(name, verdict, detail)
+        record("(ж) admin API refuses WIF token", *admin_get_status(wi))
     else:
-        for name in ("(в) models.list == expected", "(г) responses.create allowed model", "(д) responses.create denied model"):
+        for name in ("(в) models.list == expected", "(г) responses.create allowed model", "(д) responses.create denied model", "(ж) admin API refuses WIF token"):
             record(name, oc.UNKNOWN, "not run: token exchange failed")
 
     bad = [f"{n}={v}" for n, v in results if v != oc.PASS]
