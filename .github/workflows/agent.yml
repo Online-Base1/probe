@@ -16,6 +16,11 @@
 # Установщик action (curl | bash) не используется.
 # Версию CLI поднимать только вместе с SHA claude-code-action, одной заявкой.
 #
+# Снимок задания для ревьюера (D-101 §c, D-102 §b, D-103 §b) пишет отдельный
+# job task-snapshot на другом раннере, до роли и только из inputs.task — не
+# из рабочего дерева. Артефакт agent-task-<sha256 байтов задания>: подменить
+# содержимое без смены имени нельзя, а job роли артефакт не трогает.
+#
 # Известное ограничение: ручная отмена прогона и зависание вне роли
 # пропускают Verify envelope (вариант 2 — отдельный job — в запасе).
 name: agent
@@ -47,7 +52,51 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  task-snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Токен не нужен: артефакт выкладывается служебным токеном раннера.
+    permissions: {}
+    outputs:
+      sha256: ${{ steps.snap.outputs.sha256 }}
+      artifact: ${{ steps.snap.outputs.artifact }}
+    steps:
+      # Байты задания — ровно те, что пришли во входе: printf '%s' без
+      # добавления перевода строки, без перекодировки и обрезки. Хеш — от
+      # этих же байтов; ревьюер сверяет его и отправляет модели их же.
+      - name: Snapshot task from inputs
+        id: snap
+        shell: bash
+        env:
+          TASK: ${{ inputs.task }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/agent-task"
+          mkdir -p "$d"
+          printf '%s' "$TASK" > "$d/task.txt"
+          sha="$(sha256sum "$d/task.txt" | cut -d' ' -f1)"
+          size="$(wc -c < "$d/task.txt" | tr -d ' ')"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "artifact=agent-task-$sha" >> "$GITHUB_OUTPUT"
+          echo "path=$d/task.txt" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Снимок задания"
+            echo
+            echo "| артефакт | sha256 | байт |"
+            echo "|---|---|---|"
+            echo "| agent-task-$sha | \`$sha\` | $size |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload task snapshot
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.snap.outputs.artifact }}
+          path: ${{ steps.snap.outputs.path }}
+          retention-days: 14
+          if-no-files-found: error
+
   role:
+    needs: task-snapshot
     runs-on: ubuntu-24.04
     # Потолок времени прогона. Вместе с --max-turns 40 ограничивает расход
     # одного запуска; расписания нет, запуск только вручную. 40, а не 25:
@@ -81,6 +130,33 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
           permission-pull-requests: write
+
+      # Worker-токен не читает factory-knowledge (D-102 §e, D-103 §d): отказ
+      # наблюдается в каждом прогоне, до роли, fail closed. В паре — успех
+      # по своей области (probe), иначе отказ мог бы быть поломкой запроса.
+      - name: Worker token cannot read factory-knowledge
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          probe() {
+            curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$1" || echo 000
+          }
+          own="$(probe "$REPO")"
+          if [ "$own" != 200 ]; then
+            echo "::error::worker token cannot read its own repository $REPO (HTTP $own): the negative probe below would prove nothing"
+            exit 1
+          fi
+          fk="$(probe Online-Base1/factory-knowledge)"
+          case "$fk" in
+            403|404) echo "worker token: $REPO -> $own, Online-Base1/factory-knowledge -> $fk (refused, as required)" ;;
+            2??) echo "::error::worker token READ Online-Base1/factory-knowledge (HTTP $fk): the agent reaches the reviewer's prompts; role not started"; exit 1 ;;
+            *) echo "::error::worker token probe of Online-Base1/factory-knowledge: unexpected HTTP $fk (UNKNOWN); role not started"; exit 1 ;;
+          esac
 
       - name: Checkout with app token
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

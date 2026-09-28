@@ -1,0 +1,85 @@
+# Проверки механики ревьюера на заявках (D-101 §e).
+#
+#   unit           — тесты .github/reviewer без сети, на каждой заявке;
+#   prompt-present — промпт и схема ревьюера лежат по точным путям на main
+#                    factory-knowledge. Отсутствие — UNKNOWN и красный CI
+#                    ЗАЯВКИ: постройка без промпта не вливается. Сам ревьюер
+#                    при этом остаётся неблокирующим (D-098). Пути — D-104 §h.
+#
+# prompt-present читает приватный factory-knowledge токеном приложения
+# ревьюера только с contents:read. На заявках агента (agent/*) этот job не
+# выполняется: секрет приложения ревьюера заявкам исполнителя не выдаётся.
+# Шаг не запускает код из рабочего дерева — только curl по константным путям.
+name: reviewer-ci
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/reviewer/
+            .github/workflows/
+          sparse-checkout-cone-mode: false
+      - name: Reviewer unit tests (offline)
+        shell: bash
+        run: REVIEWER_WORKFLOW_TESTS=required PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/reviewer/tests -v
+
+  prompt-present:
+    if: ${{ !startsWith(github.head_ref, 'agent/') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Reviewer app is configured
+        shell: bash
+        env:
+          CLIENT_ID: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          HAS_KEY: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY != '' }}
+        run: |
+          if [ -z "$CLIENT_ID" ] || [ "$HAS_KEY" != true ]; then
+            echo "::error::UNKNOWN(reviewer_app_not_configured): FACTORY_REVIEWER_APP_CLIENT_ID / FACTORY_REVIEWER_APP_PRIVATE_KEY are not set, the prompt cannot be checked"
+            exit 1
+          fi
+
+      - name: Mint reviewer token (factory-knowledge, contents:read)
+        id: fk
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: factory-knowledge
+          permission-contents: read
+
+      # Пути — те же константы, что PROMPT_PATH и FORMAT_PATH в reviewer_lib.py
+      # (сверку держит тест test_ci_paths_match_lib).
+      - name: Prompt and schema exist at exact paths on factory-knowledge main
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.fk.outputs.token }}
+        run: |
+          set -uo pipefail
+          red=0
+          for path in prompts/05-review.md standards/findings-format.md; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/Online-Base1/factory-knowledge/contents/$path?ref=main" || echo 000)"
+            case "$code" in
+              200) echo "present: factory-knowledge@main:$path" ;;
+              404) echo "::error::UNKNOWN(prompt_missing): factory-knowledge@main:$path does not exist"; red=1 ;;
+              *) echo "::error::UNKNOWN(prompt_check:$code): factory-knowledge@main:$path"; red=1 ;;
+            esac
+          done
+          exit "$red"
