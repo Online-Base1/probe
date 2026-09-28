@@ -90,6 +90,9 @@ jobs:
         shell: bash
         env:
           CLAUDE_CODE_VERSION: "2.1.283" # = версия, зашитая в claude-code-action 756cc22
+          # SDK, который несёт claude-code-action 756cc22 (bun.lock:
+          # @anthropic-ai/claude-agent-sdk). Поднимать вместе с SHA action.
+          CLAUDE_CODE_ACTION_SDK_VERSION: "0.3.283"
           CLAUDE_CODE_KEY_FPR: 31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
           CLAUDE_CODE_PLATFORM: linux-x64
           CLAUDE_CODE_RELEASES: https://downloads.claude.ai/claude-code-releases
@@ -137,6 +140,11 @@ jobs:
             exit 1
           fi
           echo "sdkCompat: $(jq -c '.sdkCompat // null' "$work/manifest.json")"
+          # Совместимость CLI и SDK action: только предупреждение, прогон не валится.
+          if ! jq -e --arg v "$CLAUDE_CODE_ACTION_SDK_VERSION" \
+               '(.sdkCompat.testedWrapperVersions // []) | index($v) != null' "$work/manifest.json" > /dev/null; then
+            echo "::warning::SDK $CLAUDE_CODE_ACTION_SDK_VERSION of claude-code-action is not in sdkCompat.testedWrapperVersions of CLI $V"
+          fi
 
           # 4. Бинарник: размер и sha256 обязаны совпасть с манифестом.
           curl -fsSL "$CLAUDE_CODE_RELEASES/$V/$P/$bin_name" -o "$work/claude"
@@ -438,11 +446,23 @@ jobs:
             echo "upload=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          pattern='ghs_[A-Za-z0-9]+|gh[opur]_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|sk-ant-[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]+'
-          if grep -qE "$pattern" "$f"; then
-            # Печатаются только номера строк, не совпадения.
-            lines="$(grep -nE "$pattern" "$f" | cut -d: -f1 | sort -un | tr '\n' ' ')"
-            echo "::error::execution log contains token-like strings (lines: $lines); not uploading"
+          # Каждый шаблон проверяется отдельно, чтобы в отчёте было видно, какой
+          # сработал; печатаются имя шаблона и номера строк, не совпадения.
+          found=0
+          while IFS='=' read -r pname prx; do
+            if grep -qE "$prx" "$f"; then
+              lines="$(grep -nE "$prx" "$f" | cut -d: -f1 | sort -un | tr '\n' ' ')"
+              echo "::error::execution log matches token pattern '$pname' (lines: $lines); not uploading"
+              found=1
+            fi
+          done <<'PATTERNS'
+          ghs_=ghs_[A-Za-z0-9]+
+          gh[opur]_=gh[opur]_[A-Za-z0-9]+
+          github_pat_=github_pat_[A-Za-z0-9_]+
+          sk-ant-=sk-ant-[A-Za-z0-9_-]+
+          eyJ=eyJ[A-Za-z0-9_-]+
+          PATTERNS
+          if [ "$found" = 1 ]; then
             echo "upload=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi

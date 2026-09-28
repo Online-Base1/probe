@@ -12,6 +12,14 @@
 #        Если push прошёл, ветка удаляется через API;
 #   (г)  номер созданного PR печатается, чтобы вручную убедиться, что ci.yml
 #        запустился на заявке, открытой приложением.
+#   (г+) ruleset app-branches пропускает приложение в agent/**: создание и
+#        удаление agent/neg-test-<run_id> через API — 201 и 204;
+#   (г−create) вне agent/** приложение ветку создать не может: API — отказ
+#        422/403 с упоминанием rule/ruleset, git push — отказ с GH013;
+#   (г−delete) и удалить не может: ci/app-delete-target (создаёт владелец
+#        до прогона) через API и через git push :ref — отказ; после — ветка
+#        на месте. Проверок main (удаление, перезапись) здесь нет намеренно:
+#        при сбое защиты такая проверка разрушительна.
 #
 # Созданные ветка и черновик PR остаются как свидетельство; закрываются вручную.
 name: app-token-test
@@ -189,12 +197,82 @@ jobs:
             echo "(в−git) not run: positive check failed, the branch may not exist"
           fi
 
+          # (г+ / г−create / г−delete) ruleset app-branches (D-089 §c).
+          g_pos=0; g_create_api=0; g_create_git=0; g_delete_api=0; g_delete_git=0; g_target_kept=0
+          ruleset_refusal() { # тело ответа API упоминает правило/ruleset
+            jq -r '.message // "" , (.errors // [] | tostring)' /tmp/body.json | grep -qiE 'rule'
+          }
+          main_sha="$(api GET /git/ref/heads/main > /dev/null; jq -r '.object.sha // empty' /tmp/body.json)"
+
+          # (г+) agent/** — создать и удалить через API.
+          gbranch="agent/neg-test-$RUN_ID"
+          code="$(api POST /git/refs "$(jq -nc --arg r "refs/heads/$gbranch" --arg s "$main_sha" '{ref:$r,sha:$s}')")"
+          echo "(г+) POST ref $gbranch -> $code (expected 201)"
+          if [ "$code" = 201 ]; then
+            code="$(api DELETE "/git/refs/heads/$gbranch")"
+            echo "(г+) DELETE ref $gbranch -> $code (expected 204)"
+            [ "$code" = 204 ] && g_pos=1
+          fi
+
+          # (г−create) вне agent/** — через API.
+          cbranch="ci/neg-test-$RUN_ID"
+          code="$(api POST /git/refs "$(jq -nc --arg r "refs/heads/$cbranch" --arg s "$main_sha" '{ref:$r,sha:$s}')")"
+          echo "(г−create) POST ref $cbranch -> $code (expected 422/403 with a rule refusal)"
+          jq -r '"     message: " + (.message // "")' /tmp/body.json
+          case "$code" in
+            422|403) ruleset_refusal && g_create_api=1 || echo "     refused, but not by a rule" ;;
+            201) echo "::error::(г−create) app CREATED $cbranch outside agent/** — ruleset does not hold; the branch must be removed by the owner" ;;
+          esac
+
+          # (г−create) и (г−delete) через git push.
+          gwork="$(mktemp -d)"
+          if git clone --quiet --depth 1 --branch main \
+               "https://x-access-token:${TOKEN}@github.com/$REPO" "$gwork/repo" 2> "$gwork/clone.err"; then
+            cd "$gwork/repo"
+            if git push origin "HEAD:refs/heads/$cbranch-git" > "$gwork/c.out" 2> "$gwork/c.err"; then crc=0; else crc=$?; fi
+            echo "(г−create) git push HEAD:refs/heads/$cbranch-git -> exit $crc (expected non-zero, GH013)"
+            redact < "$gwork/c.err" | sed 's/^/       /'
+            if [ "$crc" -ne 0 ] && grep -q 'GH013' "$gwork/c.err"; then g_create_git=1
+            elif [ "$crc" -eq 0 ]; then echo "::error::(г−create) app CREATED $cbranch-git by git push — ruleset does not hold; the branch must be removed by the owner"; fi
+
+            if git ls-remote --exit-code origin refs/heads/ci/app-delete-target > /dev/null 2>&1; then
+              if git push origin :refs/heads/ci/app-delete-target > "$gwork/d.out" 2> "$gwork/d.err"; then drc=0; else drc=$?; fi
+              echo "(г−delete) git push :refs/heads/ci/app-delete-target -> exit $drc (expected non-zero, GH013)"
+              redact < "$gwork/d.err" | sed 's/^/       /'
+              if [ "$drc" -ne 0 ] && grep -q 'GH013' "$gwork/d.err"; then g_delete_git=1; fi
+            else
+              echo "::error::(г−delete) precondition failed: ci/app-delete-target does not exist — the owner creates it before the run; nothing is proven"
+            fi
+            cd - > /dev/null
+          else
+            echo "(г) clone failed:"; redact < "$gwork/clone.err" | sed 's/^/       /'
+          fi
+          rm -rf "$gwork"
+
+          # (г−delete) через API и проверка, что ветка на месте.
+          code="$(api GET /git/ref/heads/ci/app-delete-target)"
+          if [ "$code" = 200 ]; then
+            code="$(api DELETE /git/refs/heads/ci/app-delete-target)"
+            echo "(г−delete) DELETE ref ci/app-delete-target -> $code (expected 422/403 with a rule refusal)"
+            jq -r '"     message: " + (.message // "")' /tmp/body.json 2>/dev/null || true
+            case "$code" in
+              422|403) ruleset_refusal && g_delete_api=1 || echo "     refused, but not by a rule" ;;
+              204) echo "::error::(г−delete) app DELETED ci/app-delete-target — ruleset does not hold" ;;
+            esac
+          fi
+          code="$(api GET /git/ref/heads/ci/app-delete-target)"
+          echo "(г−delete) GET ref ci/app-delete-target after -> $code (expected 200)"
+          [ "$code" = 200 ] && g_target_kept=1
+
           {
             echo "### app-token-test"
             echo "- (в+) branch, file, draft PR: $([ "$pos_ok" = 1 ] && echo PASS || echo FAIL)"
             echo "- (в−) workflow write refused: $([ "$neg_ok" = 1 ] && echo PASS || echo FAIL)"
             echo "- (в−git) workflow push refused: $([ "$git_ok" = 1 ] && echo PASS || echo FAIL)"
             echo "- (г) PR opened by app: ${pr_number:+#$pr_number} — check that ci.yml ran on it"
+            echo "- (г+) agent/** create+delete: $([ "$g_pos" = 1 ] && echo PASS || echo FAIL)"
+            echo "- (г−create) outside agent/**: API $([ "$g_create_api" = 1 ] && echo PASS || echo FAIL), git $([ "$g_create_git" = 1 ] && echo PASS || echo FAIL)"
+            echo "- (г−delete) ci/app-delete-target: API $([ "$g_delete_api" = 1 ] && echo PASS || echo FAIL), git $([ "$g_delete_git" = 1 ] && echo PASS || echo FAIL), still exists $([ "$g_target_kept" = 1 ] && echo PASS || echo FAIL)"
           } >> "$GITHUB_STEP_SUMMARY"
 
           [ -n "$pr_number" ] && echo "(г) PR opened by app: https://github.com/$REPO/pull/$pr_number"
@@ -202,5 +280,11 @@ jobs:
           [ "$pos_ok" = 1 ] || { echo "::error::(в+) positive check failed"; failed=1; }
           [ "$neg_ok" = 1 ] || { echo "::error::(в−) workflow write was not refused with 403/404"; failed=1; }
           [ "$git_ok" = 1 ] || { echo "::error::(в−git) workflow push was not refused"; failed=1; }
+          [ "$g_pos" = 1 ] || { echo "::error::(г+) app could not create/delete a branch under agent/**"; failed=1; }
+          [ "$g_create_api" = 1 ] || { echo "::error::(г−create) API creation outside agent/** was not refused by a rule"; failed=1; }
+          [ "$g_create_git" = 1 ] || { echo "::error::(г−create) git push creation outside agent/** was not refused with GH013"; failed=1; }
+          [ "$g_delete_api" = 1 ] || { echo "::error::(г−delete) API deletion of ci/app-delete-target was not refused by a rule"; failed=1; }
+          [ "$g_delete_git" = 1 ] || { echo "::error::(г−delete) git push deletion of ci/app-delete-target was not refused with GH013"; failed=1; }
+          [ "$g_target_kept" = 1 ] || { echo "::error::(г−delete) ci/app-delete-target is gone"; failed=1; }
           [ "$failed" = 0 ] || exit 1
-          echo "app token: (в+) PASS, (в−) PASS, (в−git) PASS"
+          echo "app token: (в+) PASS, (в−) PASS, (в−git) PASS, (г+) PASS, (г−create) PASS, (г−delete) PASS"
