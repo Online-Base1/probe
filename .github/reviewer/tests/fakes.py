@@ -13,6 +13,7 @@ RUN_ID = 900001
 HEAD = "a" * 40
 KNOW_SHA = "b" * 40
 PROMPT_SHA = "c" * 40
+FORMAT_SHA = "9" * 40
 CANARY = "CANARY-7f3e-do-not-leak"
 
 SCHEMA = {
@@ -35,6 +36,12 @@ SCHEMA = {
         },
     },
 }
+
+
+def format_md(schema, blocks=1):
+    """standards/findings-format.md: проза и ровно один блок ```json со схемой."""
+    block = "```json\n" + json.dumps(schema, indent=2) + "\n```\n"
+    return ("# Формат находок\n\nОтвет — JSON по схеме ниже.\n\n" + block * blocks + "\nПример: `{\"findings\": []}`\n").encode()
 
 
 def task_zip(data, name="task.txt"):
@@ -63,7 +70,7 @@ class World:
                             "output": {"summary": "agent text " + CANARY}}]
         self.statuses = []
         self.prompt = "You are the reviewer.".encode()
-        self.schema = json.dumps(SCHEMA).encode()
+        self.format = format_md(SCHEMA)
         self.p1_status = 403
         self.p2_status = 403
         self.comment_status = 201
@@ -73,9 +80,10 @@ class World:
         self.redirect_auth = []
 
     @staticmethod
-    def agent_pr(n, sha=HEAD, login="online-base1-factory-worker[bot]", ref="agent/2026-09-28-x", draft=True):
+    def agent_pr(n, sha=HEAD, login="online-base1-factory-worker[bot]", ref="agent/2026-09-28-x", draft=True, base="main"):
         return {"number": n, "state": "open", "draft": draft, "user": {"login": login},
                 "title": "title " + CANARY, "body": "body " + CANARY,
+                "base": {"ref": base},
                 "head": {"ref": ref, "sha": sha, "repo": {"full_name": REPO}}}
 
     def transport(self, method, url, headers, body):
@@ -127,12 +135,13 @@ class World:
             return self.p2_status, {}, b"{}"
         if method == "GET" and path_only == f"/repos/{KR}/commits/main":
             return 200, {}, json.dumps({"sha": KNOW_SHA}).encode()
-        if method == "GET" and path_only == f"/repos/{KR}/contents/prompts/reviewer/prompt.md":
+        if method == "GET" and path_only == f"/repos/{KR}/contents/prompts/05-review.md":
             return (200, {}, self.prompt) if self.prompt is not None else (404, {}, b"{}")
-        if method == "GET" and path_only == f"/repos/{KR}/contents/prompts/reviewer/findings.schema.json":
-            return (200, {}, self.schema) if self.schema is not None else (404, {}, b"{}")
+        if method == "GET" and path_only == f"/repos/{KR}/contents/standards/findings-format.md":
+            return (200, {}, self.format) if self.format is not None else (404, {}, b"{}")
         if method == "GET" and path_only == f"/repos/{KR}/commits":
-            return 200, {}, json.dumps([{"sha": PROMPT_SHA}]).encode()
+            sha = FORMAT_SHA if "findings-format" in path else PROMPT_SHA
+            return 200, {}, json.dumps([{"sha": sha}]).encode()
         return 599, {}, json.dumps({"unrouted": [method, path]}).encode()
 
     @staticmethod

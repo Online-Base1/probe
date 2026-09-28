@@ -28,8 +28,11 @@ TASK_FILE = "task.txt"
 
 KNOWLEDGE_REPO = "Online-Base1/factory-knowledge"
 KNOWLEDGE_REF = "main"
-PROMPT_PATH = "prompts/reviewer/prompt.md"
-SCHEMA_PATH = "prompts/reviewer/findings.schema.json"
+# Пути названы в D-104 §h: промпт один на обоих ревьюеров, формат находок —
+# отдельный стандарт; промпт на него ссылается. Схема ответа — единственный
+# блок ```json в формате (договор с «Архитектурой», см. README).
+PROMPT_PATH = "prompts/05-review.md"
+FORMAT_PATH = "standards/findings-format.md"
 
 WORKER_LOGIN = "online-base1-factory-worker[bot]"
 REVIEWER_LOGIN = "online-base1-reviewer[bot]"
@@ -42,11 +45,14 @@ CANARY_WORKFLOW_PATH = ".github/workflows/canary-trigger.yml"
 # пока None — исход UNKNOWN(..._not_configured), ревью не делается.
 CANARY_PR = None
 CANARY_BRANCH = "canary/known-defect"
+CANARY_BASE = "canary-base"  # невливаемость базой, а не меткой (D-105 §b)
 WRITE_PROBE_ISSUE = None
 
-# Известный дефект канареечной заявки: находка обязана указывать на этот файл
-# и строку внутри окна (тело функции percent без проверки total <= 0).
-CANARY_EXPECTED = {"file": "lib/percent.ts", "lines": (5, 10)}
+# Известный дефект канареечной заявки (D-105 §d): lib/paginate.ts,
+# pageCount = Math.floor(total / pageSize) вместо ceil. Успех — находка,
+# называющая этот файл и строку с floor; «нет теста на остаток» без этой
+# строки успехом не считается.
+CANARY_EXPECTED = {"file": "lib/paginate.ts", "lines": (9, 9)}
 
 # Незавершённые исходы прогона агента (D-102 §c). failure — отдельно: он
 # «незавершённый», только если заявки нет (провал до PR).
@@ -186,22 +192,31 @@ def canary_pr(pr):
         raise Unknown("canary_pr_state")
     if (pr.get("head") or {}).get("ref") != CANARY_BRANCH:
         raise Unknown("canary_pr_branch")
+    if (pr.get("base") or {}).get("ref") != CANARY_BASE:
+        raise Unknown("canary_pr_base")
     return pr["number"], pr["head"]["sha"]
 
 
 # --- review ---
 
-def done_marker(head_sha):
+def done_marker(head_sha, canary_run_id=None):
+    """Ключ «уже ревьюили»: PR + head SHA; для канарейки ещё run_id её прогона.
+
+    Дифф канарейки один и тот же каждую ночь: без run_id со второй ночи ревью
+    пропускалось бы, и пропуск выглядел бы её успехом (D-105 §a).
+    """
+    if canary_run_id is not None:
+        return f"<!-- factory-reviewer: done head_sha={head_sha} canary_run_id={canary_run_id} -->"
     return f"<!-- factory-reviewer: done head_sha={head_sha} -->"
 
 
-def already_reviewed(comments, head_sha):
-    """Комментарий DONE с этим head_sha — только от самого ревьюера.
+def already_reviewed(comments, head_sha, canary_run_id=None):
+    """Комментарий DONE с этим ключом — только от самого ревьюера.
 
     Маркер от кого-то другого не засчитывается: иначе автор заявки мог бы
     выключить ревью, оставив строку в комментарии.
     """
-    marker = done_marker(head_sha)
+    marker = done_marker(head_sha, canary_run_id)
     return any((c.get("user") or {}).get("login") == REVIEWER_LOGIN and marker in (c.get("body") or "")
                for c in comments)
 
@@ -267,6 +282,20 @@ def check_schema_supported(schema, path="$"):
         check_schema_supported(schema["items"], f"{path}[]")
     if isinstance(schema.get("additionalProperties"), dict):
         raise Unknown(f"schema_unsupported:{path}:additionalProperties(schema)")
+
+
+_JSON_BLOCK = re.compile(r"^```json[ \t]*\n(.*?)^```[ \t]*$", re.S | re.M)
+
+
+def schema_from_format(text):
+    """Схема ответа — ровно один блок ```json в standards/findings-format.md."""
+    blocks = _JSON_BLOCK.findall(text)
+    if len(blocks) != 1:
+        raise Unknown(f"format_schema_blocks:{len(blocks)}")
+    try:
+        return json.loads(blocks[0])
+    except ValueError:
+        raise Unknown("format_schema_not_json")
 
 
 def check_schema_contract(schema):
@@ -366,8 +395,8 @@ def clean(text, limit=500):
     return text[:limit]
 
 
-def format_comment(findings, prompt_sha, model, head_sha, run_id, trigger):
-    lines = [done_marker(head_sha),
+def format_comment(findings, prompt_sha, model, head_sha, run_id, trigger, format_sha=""):
+    lines = [done_marker(head_sha, run_id if trigger == "canary" else None),
              f"### Ревью другим семейством (прогон агента {run_id})",
              "",
              "Неблокирующее. Модель не видит описания заявки, заголовка и сообщений коммитов (D-091 §b).",
@@ -386,16 +415,30 @@ def format_comment(findings, prompt_sha, model, head_sha, run_id, trigger):
                 lines.extend("  " + ln for ln in clean(text, 1500).split("\n"))
                 lines.append("  ```")
     lines += ["",
-              f"_head_sha `{head_sha}` · MODEL `{model}` · PROMPT_SHA `{prompt_sha}` · trigger `{trigger}`_"]
+              f"_head_sha `{head_sha}` · MODEL `{model}` · PROMPT_SHA `{prompt_sha}` · FORMAT_SHA `{format_sha}` · trigger `{trigger}`_"]
     return "\n".join(lines) + "\n"
 
 
-def summary_lines(result, findings_count, prompt_sha, model, canary):
+def summary_lines(result, findings_count, prompt_sha, model, canary, kind="", pr="", head_sha="", format_sha=""):
     if findings_count is None:
         findings = "FINDINGS=n/a"
     elif findings_count == 0:
         findings = "FINDINGS=0 — находок нет"
     else:
         findings = f"FINDINGS={findings_count}"
+    # Одна строка фиксированного вида (D-106 §e): из неё учёт наполняется
+    # задним числом, пока живёт журнал прогонов. Порядок полей не меняется.
+    record = " ".join([
+        "REVIEW_RECORD",
+        f"KIND={kind or 'n/a'}",
+        f"PR={pr or 'n/a'}",
+        f"HEAD_SHA={head_sha or 'n/a'}",
+        f"RESULT={result.replace(' ', '_')}",
+        f"FINDINGS={'n/a' if findings_count is None else findings_count}",
+        f"PROMPT_SHA={prompt_sha or 'n/a'}",
+        f"FORMAT_SHA={format_sha or 'n/a'}",
+        f"MODEL={model or 'n/a'}",
+        f"CANARY={canary}",
+    ])
     return [f"REVIEW_RESULT={result}", findings, f"PROMPT_SHA={prompt_sha or 'n/a'}",
-            f"MODEL={model or 'n/a'}", f"CANARY={canary}"]
+            f"FORMAT_SHA={format_sha or 'n/a'}", f"MODEL={model or 'n/a'}", f"CANARY={canary}", record]

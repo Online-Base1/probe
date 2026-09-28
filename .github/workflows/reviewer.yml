@@ -13,11 +13,16 @@
 #             не комментирует там, (п2) токен probe не одобряет канареечную
 #             заявку; сверка OpenAI (openai_checks.py): список моделей,
 #             успех gpt-5.3-codex, model_not_found для gpt-4.1-nano. Затем
-#             промпт и схема с main factory-knowledge, запрос по белому списку
+#             промпт prompts/05-review.md и формат standards/findings-format.md
+#             с main factory-knowledge (D-104 §h), запрос по белому списку
 #             (задание, дифф, статусы гейтов — без body, title и сообщений
 #             коммитов), ответ по схеме, usage > 0, комментарий с маркером head_sha.
 #   report  — REVIEW_RESULT=DONE|AGENT_RUN_INCOMPLETE(..)|UNKNOWN(..), FINDINGS,
-#             PROMPT_SHA, MODEL, CANARY; UNKNOWN и CANARY=FAIL — красный.
+#             PROMPT_SHA, FORMAT_SHA, MODEL, CANARY и строка REVIEW_RECORD
+#             фиксированного вида (D-106 §e); UNKNOWN и CANARY=FAIL — красный.
+#
+# Ключ «уже ревьюили» — PR + head SHA, для канарейки ещё run_id прогона
+# canary-trigger (D-105 §a); concurrency — по PR + head SHA.
 #
 # Логика — .github/reviewer/reviewer.py и reviewer_lib.py; тесты без сети —
 # .github/reviewer/tests/. Токены не печатаются.
@@ -88,6 +93,7 @@ jobs:
       result: ${{ steps.review.outputs.result }}
       findings: ${{ steps.review.outputs.findings }}
       prompt_sha: ${{ steps.review.outputs.prompt_sha }}
+      format_sha: ${{ steps.review.outputs.format_sha }}
       model: ${{ steps.review.outputs.model }}
       canary: ${{ steps.review.outputs.canary }}
     steps:
@@ -172,10 +178,13 @@ jobs:
           RESOLVE_OUTCOME: ${{ needs.resolve.outputs.outcome }}
           RESOLVE_REASON: ${{ needs.resolve.outputs.reason }}
           RESOLVE_TRIGGER: ${{ needs.resolve.outputs.trigger }}
+          RESOLVE_PR: ${{ needs.resolve.outputs.pr }}
+          RESOLVE_HEAD_SHA: ${{ needs.resolve.outputs.head_sha }}
           REVIEW_JOB_RESULT: ${{ needs.review.result }}
           REVIEW_RESULT: ${{ needs.review.outputs.result }}
           REVIEW_FINDINGS: ${{ needs.review.outputs.findings }}
           REVIEW_PROMPT_SHA: ${{ needs.review.outputs.prompt_sha }}
+          REVIEW_FORMAT_SHA: ${{ needs.review.outputs.format_sha }}
           REVIEW_MODEL: ${{ needs.review.outputs.model }}
           REVIEW_CANARY: ${{ needs.review.outputs.canary }}
         run: python3 .github/reviewer/reviewer.py report

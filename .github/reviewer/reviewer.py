@@ -164,31 +164,36 @@ def fetch_knowledge(gh_knowledge):
     ref = gh_knowledge.json(f"/repos/{rl.KNOWLEDGE_REPO}/commits/{rl.KNOWLEDGE_REF}", "knowledge_ref")["sha"]
     q = urllib.parse.quote
     prompt = gh_knowledge.raw(f"/repos/{rl.KNOWLEDGE_REPO}/contents/{q(rl.PROMPT_PATH)}?ref={ref}", "prompt")
-    schema_raw = gh_knowledge.raw(f"/repos/{rl.KNOWLEDGE_REPO}/contents/{q(rl.SCHEMA_PATH)}?ref={ref}", "schema")
+    fmt = gh_knowledge.raw(f"/repos/{rl.KNOWLEDGE_REPO}/contents/{q(rl.FORMAT_PATH)}?ref={ref}", "format")
     try:
-        schema = json.loads(schema_raw)
-    except ValueError:
-        raise rl.Unknown("schema_not_json")
-    rl.check_schema_contract(schema)
-    commits = gh_knowledge.json(f"/repos/{rl.KNOWLEDGE_REPO}/commits?path={q(rl.PROMPT_PATH)}&sha={ref}&per_page=1", "prompt_commits")
-    if not commits:
-        raise rl.Unknown("prompt_sha_unknown")
-    try:
-        prompt_text = prompt.decode("utf-8")
+        prompt_text, fmt_text = prompt.decode("utf-8"), fmt.decode("utf-8")
     except UnicodeDecodeError:
-        raise rl.Unknown("prompt_not_utf8")
-    return prompt_text, schema, commits[0]["sha"]
+        raise rl.Unknown("knowledge_not_utf8")
+    schema = rl.schema_from_format(fmt_text)
+    rl.check_schema_contract(schema)
+
+    def last_commit(path, what):
+        commits = gh_knowledge.json(f"/repos/{rl.KNOWLEDGE_REPO}/commits?path={q(path)}&sha={ref}&per_page=1", what)
+        if not commits:
+            raise rl.Unknown(f"{what}_unknown")
+        return commits[0]["sha"]
+
+    # Промпт ссылается на формат, а не повторяет его (D-104 §h): модели
+    # уходят оба файла; SHA обоих — в комментарий и итог.
+    instructions = prompt_text + "\n\n---\n\n" + fmt_text
+    return instructions, schema, last_commit(rl.PROMPT_PATH, "prompt_sha"), last_commit(rl.FORMAT_PATH, "format_sha")
 
 
 def review(ctx):
     """Возвращает dict: result, findings, prompt_sha, model, canary, comment_posted."""
-    st = {"result": None, "findings": None, "prompt_sha": "", "model": oc.REVIEW_MODEL,
+    st = {"result": None, "findings": None, "prompt_sha": "", "format_sha": "", "model": oc.REVIEW_MODEL,
           "canary": "n/a" if ctx["trigger"] != "canary" else "FAIL", "skipped": False}
     repo, pr, head_sha = ctx["repo"], ctx["pr"], ctx["head_sha"]
     gh_read, gh_probe, gh_knowledge = ctx["gh_read"], ctx["gh_probe"], ctx["gh_knowledge"]
     try:
         comments = gh_read.paginate(f"/repos/{repo}/issues/{pr}/comments", "pr_comments")
-        if rl.already_reviewed(comments, head_sha):
+        canary_run = ctx["run_id"] if ctx["trigger"] == "canary" else None
+        if rl.already_reviewed(comments, head_sha, canary_run):
             st.update(result=rl.DONE, skipped=True, canary="n/a" if ctx["trigger"] != "canary" else "PASS")
             return st
 
@@ -201,8 +206,8 @@ def review(ctx):
             if verdict != oc.PASS:
                 raise rl.Unknown(f"openai_boundary:{name.split(' ')[0]}={verdict}")
 
-        prompt, schema, prompt_sha = fetch_knowledge(gh_knowledge)
-        st["prompt_sha"] = prompt_sha
+        prompt, schema, prompt_sha, format_sha = fetch_knowledge(gh_knowledge)
+        st["prompt_sha"], st["format_sha"] = prompt_sha, format_sha
 
         _, task = fetch_task(gh_read, repo, ctx["run_id"])
         pull = gh_read.json(f"/repos/{repo}/pulls/{pr}", "pull")
@@ -230,7 +235,7 @@ def review(ctx):
                 raise rl.Unknown("canary_missed")
             st["canary"] = "PASS"
 
-        body = rl.format_comment(findings, prompt_sha, oc.REVIEW_MODEL, head_sha, ctx["run_id"], ctx["trigger"])
+        body = rl.format_comment(findings, prompt_sha, oc.REVIEW_MODEL, head_sha, ctx["run_id"], ctx["trigger"], format_sha)
         status, _, _ = gh_probe.request("POST", f"/repos/{repo}/issues/{pr}/comments", {"body": body})
         if status != 201:
             raise rl.Unknown(f"comment_post:{status}")
@@ -245,7 +250,7 @@ def report(env):
     outcome, reason = env.get("RESOLVE_OUTCOME", ""), env.get("RESOLVE_REASON", "")
     trigger = env.get("RESOLVE_TRIGGER", "")
     canary = "FAIL" if trigger == "canary" else "n/a"
-    findings, prompt_sha, model = None, "", ""
+    findings, prompt_sha, format_sha, model = None, "", "", ""
     if outcome == rl.INCOMPLETE:
         result = rl.result_line(rl.INCOMPLETE, reason)
     elif outcome == rl.UNKNOWN_KIND:
@@ -257,10 +262,13 @@ def report(env):
         f = env.get("REVIEW_FINDINGS", "")
         findings = int(f) if f.isdigit() else None
         prompt_sha, model = env.get("REVIEW_PROMPT_SHA", ""), env.get("REVIEW_MODEL", "")
+        format_sha = env.get("REVIEW_FORMAT_SHA", "")
         canary = env.get("REVIEW_CANARY") or canary
     else:
         result = rl.result_line(rl.UNKNOWN_KIND, "resolve_job_" + (env.get("RESOLVE_JOB_RESULT") or "none"))
-    lines = rl.summary_lines(result, findings, prompt_sha, model, canary)
+    lines = rl.summary_lines(result, findings, prompt_sha, model, canary, kind=trigger,
+                             pr=env.get("RESOLVE_PR", ""), head_sha=env.get("RESOLVE_HEAD_SHA", ""),
+                             format_sha=format_sha)
     red = result.startswith(rl.UNKNOWN_KIND) or canary == "FAIL"
     return lines, 1 if red else 0
 
@@ -321,7 +329,8 @@ def main(argv):
         st = review(ctx)
         print(json.dumps({k: v for k, v in st.items()}, ensure_ascii=False))
         _set_outputs({"result": st["result"], "findings": "" if st["findings"] is None else st["findings"],
-                      "prompt_sha": st["prompt_sha"], "model": st["model"], "canary": st["canary"]})
+                      "prompt_sha": st["prompt_sha"], "format_sha": st["format_sha"],
+                      "model": st["model"], "canary": st["canary"]})
         return 0
     if cmd == "report":
         lines, code = report(os.environ)

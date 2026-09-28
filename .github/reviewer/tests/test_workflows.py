@@ -76,7 +76,8 @@ class Workflows(unittest.TestCase):
 
     def test_ci_paths_match_lib(self):
         t = read("reviewer-ci.yml")
-        self.assertIn(f"for path in {rl.PROMPT_PATH} {rl.SCHEMA_PATH}; do", t)
+        self.assertIn(f"for path in {rl.PROMPT_PATH} {rl.FORMAT_PATH}; do", t)
+        self.assertEqual((rl.PROMPT_PATH, rl.FORMAT_PATH), ("prompts/05-review.md", "standards/findings-format.md"))
         self.assertIn("if: ${{ !startsWith(github.head_ref, 'agent/') }}", t)
 
     def test_canary_trigger_does_nothing_else(self):

@@ -4,7 +4,7 @@
 #   prompt-present — промпт и схема ревьюера лежат по точным путям на main
 #                    factory-knowledge. Отсутствие — UNKNOWN и красный CI
 #                    ЗАЯВКИ: постройка без промпта не вливается. Сам ревьюер
-#                    при этом остаётся неблокирующим (D-098).
+#                    при этом остаётся неблокирующим (D-098). Пути — D-104 §h.
 #
 # prompt-present читает приватный factory-knowledge токеном приложения
 # ревьюера только с contents:read. На заявках агента (agent/*) этот job не
@@ -63,7 +63,7 @@ jobs:
           repositories: factory-knowledge
           permission-contents: read
 
-      # Пути — те же константы, что PROMPT_PATH и SCHEMA_PATH в reviewer_lib.py
+      # Пути — те же константы, что PROMPT_PATH и FORMAT_PATH в reviewer_lib.py
       # (сверку держит тест test_ci_paths_match_lib).
       - name: Prompt and schema exist at exact paths on factory-knowledge main
         shell: bash
@@ -72,7 +72,7 @@ jobs:
         run: |
           set -uo pipefail
           red=0
-          for path in prompts/reviewer/prompt.md prompts/reviewer/findings.schema.json; do
+          for path in prompts/05-review.md standards/findings-format.md; do
             code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
               -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/Online-Base1/factory-knowledge/contents/$path?ref=main" || echo 000)"

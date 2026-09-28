@@ -25,7 +25,7 @@ class Base(unittest.TestCase):
         self._saved = (rl.CANARY_PR, rl.WRITE_PROBE_ISSUE)
         rl.CANARY_PR, rl.WRITE_PROBE_ISSUE = CANARY_PR, PROBE_ISSUE
         self.w = F.World()
-        self.w.prs.append(F.World.agent_pr(CANARY_PR, sha="d" * 40, ref="canary/known-defect"))
+        self.w.prs.append(F.World.agent_pr(CANARY_PR, sha="d" * 40, ref="canary/known-defect", base="canary-base"))
         self.w.commit_dates["d" * 40] = "2026-01-01T00:00:00Z"
         self.w.comments[CANARY_PR] = []
 
@@ -123,6 +123,10 @@ class Resolve(Base):
         out = self.resolve(path=".github/workflows/canary-trigger.yml")
         self.assertEqual((out["outcome"], out["pr"], out["trigger"]), ("REVIEW", "50", "canary"))
 
+    def test_canary_wrong_base(self):
+        self.w.prs[-1]["base"]["ref"] = "main"
+        self.assertEqual(self.resolve(path=".github/workflows/canary-trigger.yml")["reason"], "canary_pr_base")
+
     def test_canary_not_configured(self):
         rl.CANARY_PR = None
         self.assertEqual(self.resolve(path=".github/workflows/canary-trigger.yml")["reason"], "canary_pr_not_configured")
@@ -131,12 +135,19 @@ class Resolve(Base):
 class Review(Base):
     def test_done_zero_findings(self):
         st = self.review()
-        self.assertEqual((st["result"], st["findings"], st["prompt_sha"]), ("DONE", 0, F.PROMPT_SHA))
+        self.assertEqual((st["result"], st["findings"], st["prompt_sha"], st["format_sha"]), ("DONE", 0, F.PROMPT_SHA, F.FORMAT_SHA))
         (pr, body), = self.w.posted
         self.assertEqual(pr, 7)
         self.assertIn(rl.done_marker(F.HEAD), body)
         self.assertIn("Находок нет", body)
         self.assertIn(F.PROMPT_SHA, body)
+        self.assertIn(F.FORMAT_SHA, body)
+
+    def test_instructions_carry_prompt_and_format(self):
+        self.review()
+        req = next(r for r in self.client.requests if "instructions" in r)
+        self.assertTrue(req["instructions"].startswith("You are the reviewer."))
+        self.assertIn("# Формат находок", req["instructions"])
 
     def test_request_whitelist_canary(self):
         self.review()
@@ -179,18 +190,30 @@ class Review(Base):
         self.assertEqual(self.review()["result"], "UNKNOWN(prompt_missing)")
         self.assertEqual(self.w.posted, [])
 
-    def test_schema_missing(self):
-        self.w.schema = None
-        self.assertEqual(self.review()["result"], "UNKNOWN(schema_missing)")
+    def test_format_missing(self):
+        self.w.format = None
+        self.assertEqual(self.review()["result"], "UNKNOWN(format_missing)")
+
+    def test_format_without_json_block(self):
+        self.w.format = b"# Format\n\nNo schema here.\n"
+        self.assertEqual(self.review()["result"], "UNKNOWN(format_schema_blocks:0)")
+
+    def test_format_two_json_blocks(self):
+        self.w.format = F.format_md(F.SCHEMA, blocks=2)
+        self.assertEqual(self.review()["result"], "UNKNOWN(format_schema_blocks:2)")
+
+    def test_format_block_not_json(self):
+        self.w.format = b"```json\n{not json\n```\n"
+        self.assertEqual(self.review()["result"], "UNKNOWN(format_schema_not_json)")
 
     def test_schema_contract(self):
-        self.w.schema = json.dumps({"type": "object", "properties": {"items": {"type": "array"}}}).encode()
+        self.w.format = F.format_md({"type": "object", "properties": {"items": {"type": "array"}}})
         self.assertEqual(self.review()["result"], "UNKNOWN(schema_contract)")
 
     def test_schema_unsupported_keyword(self):
         s = json.loads(json.dumps(F.SCHEMA))
         s["properties"]["findings"]["items"]["properties"]["file"]["pattern"] = "^lib/"
-        self.w.schema = json.dumps(s).encode()
+        self.w.format = F.format_md(s)
         self.assertTrue(self.review()["result"].startswith("UNKNOWN(schema_unsupported"))
 
     def test_models_list_wrong(self):
@@ -260,12 +283,34 @@ class Review(Base):
         self.assertEqual((st["result"], st["canary"]), ("UNKNOWN(canary_missed)", "FAIL"))
 
     def test_canary_found(self):
-        text = json.dumps({"findings": [{"file": "lib/percent.ts", "line": 6, "message": "total 0 not rejected"}]})
+        text = json.dumps({"findings": [
+            {"file": "tests/unit/paginate.test.ts", "line": 3, "message": "no test with a remainder"},
+            {"file": "lib/paginate.ts", "line": 9, "message": "Math.floor drops the last partial page"}]})
         st = self.review(F.FakeOpenAI(review_text=text), trigger="canary", pr=CANARY_PR, head="d" * 40)
         self.assertEqual((st["result"], st["canary"]), ("DONE", "PASS"))
+        self.assertIn(rl.done_marker("d" * 40, str(F.RUN_ID)), self.w.posted[0][1])
+
+    def test_canary_only_missing_test_finding_is_fail(self):
+        text = json.dumps({"findings": [{"file": "tests/unit/paginate.test.ts", "line": 3, "message": "no test with a remainder"}]})
+        st = self.review(F.FakeOpenAI(review_text=text), trigger="canary", pr=CANARY_PR, head="d" * 40)
+        self.assertEqual((st["result"], st["canary"]), ("UNKNOWN(canary_missed)", "FAIL"))
+
+    def test_canary_reviewed_every_night(self):
+        # Вчерашний комментарий того же head_sha, но другого прогона canary-trigger
+        # не выключает сегодняшнее ревью (D-105 §a).
+        self.w.comments[CANARY_PR] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker("d" * 40, "899999")}]
+        text = json.dumps({"findings": [{"file": "lib/paginate.ts", "line": 9, "message": "floor"}]})
+        st = self.review(F.FakeOpenAI(review_text=text), trigger="canary", pr=CANARY_PR, head="d" * 40)
+        self.assertFalse(st["skipped"])
+        self.assertEqual(st["canary"], "PASS")
+
+    def test_canary_same_run_skipped(self):
+        self.w.comments[CANARY_PR] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker("d" * 40, str(F.RUN_ID))}]
+        st = self.review(trigger="canary", pr=CANARY_PR, head="d" * 40)
+        self.assertTrue(st["skipped"])
 
     def test_canary_wrong_line(self):
-        text = json.dumps({"findings": [{"file": "lib/percent.ts", "line": 20, "message": "x"}]})
+        text = json.dumps({"findings": [{"file": "lib/paginate.ts", "line": 8, "message": "x"}]})
         st = self.review(F.FakeOpenAI(review_text=text), trigger="canary", pr=CANARY_PR, head="d" * 40)
         self.assertEqual(st["canary"], "FAIL")
 
@@ -282,6 +327,19 @@ class Report(unittest.TestCase):
         self.assertIn("REVIEW_RESULT=DONE", lines)
         self.assertIn("FINDINGS=0 — находок нет", lines)
         self.assertIn("CANARY=n/a", lines)
+
+    def test_record_line_fixed_form(self):
+        lines, _ = self.run_report(RESOLVE_OUTCOME="REVIEW", RESOLVE_TRIGGER="agent", RESOLVE_PR="7",
+                                   RESOLVE_HEAD_SHA=F.HEAD, REVIEW_RESULT="DONE", REVIEW_FINDINGS="2",
+                                   REVIEW_PROMPT_SHA=F.PROMPT_SHA, REVIEW_FORMAT_SHA=F.FORMAT_SHA,
+                                   REVIEW_MODEL="gpt-5.3-codex", REVIEW_CANARY="n/a")
+        self.assertEqual(lines[-1], f"REVIEW_RECORD KIND=agent PR=7 HEAD_SHA={F.HEAD} RESULT=DONE FINDINGS=2 "
+                                    f"PROMPT_SHA={F.PROMPT_SHA} FORMAT_SHA={F.FORMAT_SHA} MODEL=gpt-5.3-codex CANARY=n/a")
+
+    def test_record_line_unknown(self):
+        lines, _ = self.run_report(RESOLVE_OUTCOME="UNKNOWN", RESOLVE_REASON="multiple_agent_prs:2", RESOLVE_TRIGGER="agent")
+        self.assertEqual(lines[-1], "REVIEW_RECORD KIND=agent PR=n/a HEAD_SHA=n/a RESULT=UNKNOWN(multiple_agent_prs:2) "
+                                    "FINDINGS=n/a PROMPT_SHA=n/a FORMAT_SHA=n/a MODEL=n/a CANARY=n/a")
 
     def test_incomplete_not_red(self):
         lines, code = self.run_report(RESOLVE_OUTCOME="AGENT_RUN_INCOMPLETE", RESOLVE_REASON="cancelled")
