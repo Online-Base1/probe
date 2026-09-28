@@ -14,8 +14,10 @@
 #        запустился на заявке, открытой приложением.
 #   (г+) ruleset app-branches пропускает приложение в agent/**: создание и
 #        удаление agent/neg-test-<run_id> через API — 201 и 204;
-#   (г−create) вне agent/** приложение ветку создать не может: API — отказ
-#        422/403 с упоминанием rule/ruleset, git push — отказ с GH013;
+#   (г−create) вне agent/** приложение ветку создать не может: API — любой
+#        ответ не 2xx и ветки после попытки нет (текст ответа GitHub не
+#        сверяется: на создание он «Reference update failed», без слова
+#        rule — прогон 36407838460); git push — отказ с GH013;
 #   (г−delete) и удалить не может: ci/app-delete-target (создаёт владелец
 #        до прогона) через API и через git push :ref — отказ; после — ветка
 #        на месте. Проверок main (удаление, перезапись) здесь нет намеренно:
@@ -217,11 +219,15 @@ jobs:
           # (г−create) вне agent/** — через API.
           cbranch="ci/neg-test-$RUN_ID"
           code="$(api POST /git/refs "$(jq -nc --arg r "refs/heads/$cbranch" --arg s "$main_sha" '{ref:$r,sha:$s}')")"
-          echo "(г−create) POST ref $cbranch -> $code (expected 422/403 with a rule refusal)"
-          jq -r '"     message: " + (.message // "")' /tmp/body.json
+          echo "(г−create) POST ref $cbranch -> $code (expected non-2xx, branch absent afterwards)"
+          echo "     response body:"; sed 's/^/       /' /tmp/body.json; echo
+          # Факт — отсутствие ветки после попытки, а не текст ответа.
+          after="$(api GET "/git/ref/heads/$cbranch")"
+          echo "(г−create) GET ref $cbranch after -> $after (expected 404)"
           case "$code" in
-            422|403) ruleset_refusal && g_create_api=1 || echo "     refused, but not by a rule" ;;
-            201) echo "::error::(г−create) app CREATED $cbranch outside agent/** — ruleset does not hold; the branch must be removed by the owner" ;;
+            2??) echo "::error::(г−create) app CREATED $cbranch outside agent/** — ruleset does not hold; the branch must be removed by the owner" ;;
+            *) if [ "$after" = 404 ]; then g_create_api=1
+               else echo "::error::(г−create) API refused ($code), but $cbranch exists afterwards ($after)"; fi ;;
           esac
 
           # (г−create) и (г−delete) через git push.
@@ -281,7 +287,7 @@ jobs:
           [ "$neg_ok" = 1 ] || { echo "::error::(в−) workflow write was not refused with 403/404"; failed=1; }
           [ "$git_ok" = 1 ] || { echo "::error::(в−git) workflow push was not refused"; failed=1; }
           [ "$g_pos" = 1 ] || { echo "::error::(г+) app could not create/delete a branch under agent/**"; failed=1; }
-          [ "$g_create_api" = 1 ] || { echo "::error::(г−create) API creation outside agent/** was not refused by a rule"; failed=1; }
+          [ "$g_create_api" = 1 ] || { echo "::error::(г−create) API creation outside agent/** was not refused (non-2xx and branch absent afterwards)"; failed=1; }
           [ "$g_create_git" = 1 ] || { echo "::error::(г−create) git push creation outside agent/** was not refused with GH013"; failed=1; }
           [ "$g_delete_api" = 1 ] || { echo "::error::(г−delete) API deletion of ci/app-delete-target was not refused by a rule"; failed=1; }
           [ "$g_delete_git" = 1 ] || { echo "::error::(г−delete) git push deletion of ci/app-delete-target was not refused with GH013"; failed=1; }
