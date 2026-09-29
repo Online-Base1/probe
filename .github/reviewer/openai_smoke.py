@@ -3,7 +3,8 @@
   (а) ключей OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENAI_ADMIN_KEY в окружении нет;
   (б) обмен OIDC-токена GitHub на токен OpenAI успешен;
   (в)–(д) — openai_checks.boundary_checks;
-  (ж) Admin API отклоняет WIF-токен (перечислить привязки без admin-ключа нельзя).
+  (ж) токен не администраторский — проба области (D-109 §d). Состав WIF-привязок
+      этим не наблюдается: допущение «состав WIF-привязок не наблюдаем» остаётся.
 
 Любой итог, кроме PASS, — выход 1. Токены не печатаются.
 """
@@ -97,9 +98,9 @@ def main():
     if exchanged:
         for name, verdict, detail in oc.boundary_checks(OpenAI(workload_identity=wi), expected):
             record(name, verdict, detail)
-        record("(ж) admin API refuses WIF token", *admin_get_status(wi))
+        record("(ж) token is not admin-scoped", *admin_get_status(wi))
     else:
-        for name in ("(в) models.list == expected", "(г) responses.create allowed model", "(д) responses.create denied model", "(ж) admin API refuses WIF token"):
+        for name in ("(в) models.list == expected", "(г) responses.create allowed model", "(д) responses.create denied model", "(ж) token is not admin-scoped"):
             record(name, oc.UNKNOWN, "not run: token exchange failed")
 
     bad = [f"{n}={v}" for n, v in results if v != oc.PASS]

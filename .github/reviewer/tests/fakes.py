@@ -76,7 +76,7 @@ class World:
         self.check_runs = [{"name": "gates / unit", "status": "completed", "conclusion": "success",
                             "output": {"summary": "agent text " + CANARY}}]
         self.statuses = []
-        self.prompt = "You are the reviewer.".encode()
+        self.prompt = "You are the reviewer. Answer strictly in the format of standards/findings-format.md.".encode()
         self.format = format_md(SCHEMA)
         self.p1_status = 403
         self.p2_status = 403

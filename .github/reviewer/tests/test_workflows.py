@@ -79,6 +79,8 @@ class Workflows(unittest.TestCase):
         self.assertIn(f"for path in {rl.PROMPT_PATH} {rl.FORMAT_PATH}; do", t)
         self.assertEqual((rl.PROMPT_PATH, rl.FORMAT_PATH), ("prompts/05-review.md", "standards/findings-format.md"))
         self.assertIn("if: ${{ !startsWith(github.head_ref, 'agent/') }}", t)
+        self.assertIn('grep -qF "standards/findings-format.md"', t)
+        self.assertIn("UNKNOWN(prompt_without_format_ref)", t)
 
     def test_canary_trigger_snapshot_and_push_probe(self):
         t = read("canary-trigger.yml")
@@ -94,6 +96,9 @@ class Workflows(unittest.TestCase):
         self.assertIn('grep -q "GH013"', probe)
         self.assertIn("refs/heads/canary/known-defect", probe)
         self.assertIn("--allow-empty", probe)
+        # bash -e раннера иначе завершит шаг молча на неудачном push (прогон 36516855926).
+        self.assertRegex(probe, r"(?m)^          set \+e$")
+        self.assertLess(probe.index("set +e"), probe.index('g push "$url"'))
         self.assertLess(probe.index("fetch -q --depth 1"), probe.index('g push "$url"'))
 
     def test_reviewer_has_no_worker_key(self):

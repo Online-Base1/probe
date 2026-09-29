@@ -172,6 +172,7 @@ def fetch_knowledge(gh_knowledge):
         prompt_text, fmt_text = prompt.decode("utf-8"), fmt.decode("utf-8")
     except UnicodeDecodeError:
         raise rl.Unknown("knowledge_not_utf8")
+    rl.check_prompt_refers_format(prompt_text)
     schema = rl.schema_from_format(fmt_text)
     rl.check_schema_contract(schema)
 

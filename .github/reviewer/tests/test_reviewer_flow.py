@@ -233,6 +233,26 @@ class Review(Base):
 
     def test_response_not_json(self):
         self.assertEqual(self.review(F.FakeOpenAI(review_text="looks fine"))["result"], "UNKNOWN(response_not_json)")
+        self.assertEqual(self.w.posted, [], "invalid JSON must not be published")
+
+    def test_response_json_with_prose_rejected(self):
+        # Только JSON (D-109 §e): JSON в обрамлении прозы — не ответ по схеме.
+        text = "Here are my findings:\n" + json.dumps({"findings": []})
+        self.assertEqual(self.review(F.FakeOpenAI(review_text=text))["result"], "UNKNOWN(response_not_json)")
+        self.assertEqual(self.w.posted, [])
+
+    def test_comment_rendered_from_json(self):
+        text = json.dumps({"findings": [{"file": "lib/x.ts", "line": 2, "message": "off by one"}]})
+        self.review(F.FakeOpenAI(review_text=text))
+        body = self.w.posted[0][1]
+        self.assertIn("- `lib/x.ts:2`", body)
+        self.assertIn("off by one", body)
+        self.assertNotIn('"findings"', body, "the comment is a rendered list, not the raw JSON")
+
+    def test_prompt_without_format_ref(self):
+        self.w.prompt = b"You are the reviewer. Old prompt without the format reference."
+        self.assertEqual(self.review()["result"], "UNKNOWN(prompt_without_format_ref)")
+        self.assertEqual(self.w.posted, [])
 
     def test_response_incomplete(self):
         self.assertEqual(self.review(F.FakeOpenAI(review_status="incomplete"))["result"], "UNKNOWN(response_status:incomplete)")
@@ -310,6 +330,12 @@ class Review(Base):
         self.w.comments[CANARY_PR] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker("d" * 40, str(F.RUN_ID))}]
         st = self.review(trigger="canary", pr=CANARY_PR, head="d" * 40)
         self.assertTrue(st["skipped"])
+
+    def test_canary_expected_is_line_9(self):
+        self.assertEqual(rl.CANARY_EXPECTED, {"file": "lib/paginate.ts", "line": 9})
+        self.assertFalse(rl.canary_found([{"file": "lib/paginate.ts", "line": 10}]))
+        self.assertFalse(rl.canary_found([{"file": "lib/paginate.ts", "line": True}]))
+        self.assertTrue(rl.canary_found([{"file": "lib/paginate.ts", "line": 9}]))
 
     def test_canary_wrong_line(self):
         text = json.dumps({"findings": [{"file": "lib/paginate.ts", "line": 8, "message": "x"}]})
