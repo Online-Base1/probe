@@ -54,7 +54,7 @@ WRITE_PROBE_ISSUE = 3
 # pageCount = Math.floor(total / pageSize) вместо ceil. Успех — находка,
 # называющая этот файл и строку с floor; «нет теста на остаток» без этой
 # строки успехом не считается.
-CANARY_EXPECTED = {"file": "lib/paginate.ts", "lines": (9, 9)}
+CANARY_EXPECTED = {"file": "lib/paginate.ts", "line": 9}  # D-109 §g
 
 # Незавершённые исходы прогона агента (D-102 §c). failure — отдельно: он
 # «незавершённый», только если заявки нет (провал до PR).
@@ -306,6 +306,16 @@ def check_schema_supported(schema, path="$"):
 _JSON_BLOCK = re.compile(r"^```json[ \t]*\n(.*?)^```[ \t]*$", re.S | re.M)
 
 
+def check_prompt_refers_format(prompt_text):
+    """Промпт ссылается на формат, а не повторяет его (D-104 §h, D-109 §f).
+
+    Проверка присутствия, не правильности: ссылку можно вписать и в старый
+    текст. Правильность промпта держит канарейка.
+    """
+    if FORMAT_PATH not in prompt_text:
+        raise Unknown("prompt_without_format_ref")
+
+
 def schema_from_format(text):
     """Схема ответа — ровно один блок ```json в standards/findings-format.md."""
     blocks = _JSON_BLOCK.findall(text)
@@ -394,10 +404,10 @@ def check_response_meta(status, input_tokens, output_tokens):
 
 def canary_found(findings):
     """Находка на известный дефект: тот же файл и строка внутри окна."""
-    lo, hi = CANARY_EXPECTED["lines"]
     for f in findings:
         line = f.get("line")
-        if f.get("file") == CANARY_EXPECTED["file"] and isinstance(line, int) and lo <= line <= hi:
+        if f.get("file") == CANARY_EXPECTED["file"] and isinstance(line, int) and not isinstance(line, bool) \
+                and line == CANARY_EXPECTED["line"]:
             return True
     return False
 
