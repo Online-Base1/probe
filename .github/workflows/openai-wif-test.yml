@@ -15,6 +15,9 @@
 #   (в) models.list точно равен .github/reviewer/expected-models.json;
 #   (г) responses.create на gpt-5.3-codex → completed, usage > 0;
 #   (д) responses.create на gpt-4.1-nano → только model_not_found;
+#   (е) обмен по привязке Reviewer-Run (probe-reviewer, reviewer.yml@main)
+#       отсюда → только invalid_grant, и только при успешном (б) в том же
+#       прогоне; иная ошибка — UNKNOWN, успех — FAIL;
 #   (ж) токен не администраторский: GET Admin API WIF-токеном → 401/403 —
 #       проба ОБЛАСТИ токена (D-109 §d). Состав WIF-привязок не наблюдаем —
 #       допущение остаётся; admin-ключ не заводится (D-103 §a).
@@ -72,6 +75,7 @@ jobs:
         env:
           OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.OPENAI_IDENTITY_PROVIDER_ID }}
           OPENAI_SERVICE_ACCOUNT_ID: ${{ vars.OPENAI_SERVICE_ACCOUNT_ID }}
+          OPENAI_REVIEWER_SERVICE_ACCOUNT_ID: ${{ vars.OPENAI_REVIEWER_SERVICE_ACCOUNT_ID }}
           OPENAI_WIF_AUDIENCE: ${{ vars.OPENAI_WIF_AUDIENCE }}
           REF: ${{ github.ref }}
         run: /tmp/venv/bin/python .github/reviewer/openai_smoke.py

@@ -291,7 +291,15 @@ jobs:
           claude_args: >-
             --max-turns 40
             --model claude-sonnet-5
+            --settings '{"attribution":{"commit":false,"pr":false}}'
             --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git switch:*),Bash(git checkout -b:*),Bash(git add:*),Bash(git commit:*),Bash(git push -u origin agent/*),Bash(gh pr create --draft:*)"
+          # Атрибуция (D-110 §e(а)): --settings с attribution в объектной
+          # форме убирает трейлер Co-Authored-By и строку в описании PR — то
+          # есть повод переписывать историю (прогон 36468629520), не
+          # способность. Имя настройки поставщика меняется с версией (класс
+          # D-100 §e); это уборка, не контроль. Контроль — ruleset на agent/**.
+          # Рамка 8 — слова для агента; границей тоже не является (D-089 §e).
+          #
           # Канарейка (D-100 §f): заведомо запрещённая и безвредная команда,
           # которую роль выполняет первой. Её отказ записывает та же система
           # разрешений в тот же permission_denials, что и настоящие отказы, и
@@ -318,6 +326,8 @@ jobs:
                это в "Что не проверено".
             7. Не утверждай в описании PR того, чего не проверил. Если задача
                противоречива или неясна — опиши это в PR, а не додумывай молча.
+            8. Опубликованную историю не переписывай: никаких --amend, rebase,
+               reset и force-push после push. Исправления — новым коммитом.
 
             Задача:
             ${{ inputs.task }}
@@ -444,9 +454,11 @@ jobs:
             # обхода. Она не засчитывается агенту: ни в отказы, ни в попытки
             # обхода. Повтор канарейки с параметром обхода — уже поведение
             # агента и засчитывается.
-            # Канарейка — проверка СИСТЕМЫ РАЗРЕШЕНИЙ: пишущая команда вне
-            # --allowedTools отклоняется (D-109 §c). Не проверка наших правил
-            # путей — «роль не пишет в чужие каталоги» проверяется отдельно.
+            # Канарейка — проверка СИСТЕМЫ РАЗРЕШЕНИЙ: запись вне рабочих
+            # каталогов отклоняется, и отказ извлекается (D-110 §a; прогон
+            # 36468629520: «path is outside the working directories»). Она не
+            # доказывает, что перечень команд что-либо ограничивает (D-109 §b),
+            # и не проверяет наши правила путей в репозитории.
             # Команда — запись (touch), а не чтение: «только читающие» команды
             # Claude Code разрешает сам, вне --allowedTools; их состав
             # неизвестен и меняется с версией (прогон 36456485058: echo
@@ -593,7 +605,7 @@ jobs:
             echo "::error::denial extraction not confirmed: the canary denial was not found (the role did not run it, or the parser does not see it)"
             exit 1
           fi
-          echo "denial extraction confirmed: canary found; agent denials $(jq -r .n "$extraction"), agent bypass attempts $(jq -r .bypass "$extraction")"
+          echo "denial extraction confirmed: a write outside the working directories was refused and the refusal was extracted (canary found); agent denials $(jq -r .n "$extraction"), agent bypass attempts $(jq -r .bypass "$extraction")"
 
       # Журнал выполнения роли — артефакт прогона: без него не видно, на что
       # пришлись отказы в разрешениях (прогоны 36306384648, 36320757375).

@@ -157,10 +157,12 @@ def write_probes(gh_knowledge, gh_probe):
         except ValueError:
             pass
     rl.judge_write_probe("p1_knowledge_comment", status)
+    print(f"(п1) comment in {rl.KNOWLEDGE_REPO}#{rl.WRITE_PROBE_ISSUE} with the contents:read token -> {status} (refused, as required)")
     status, _, _ = gh_probe.request(
         "POST", f"/repos/{os.environ.get('REPO', 'Online-Base1/probe')}/pulls/{rl.CANARY_PR}/reviews",
         {"event": "APPROVE", "body": "reviewer approve probe — this request must be refused (D-103 §e)"})
     rl.judge_write_probe("p2_canary_approve", status)
+    print(f"(п2) APPROVE on canary PR #{rl.CANARY_PR} with the probe token -> {status} (refused, as required)")
 
 
 def fetch_knowledge(gh_knowledge):
@@ -347,8 +349,25 @@ def _openai_factory():
     import openai_smoke
     from openai import OpenAI
 
-    wi = openai_smoke.workload_identity()
-    wi["service_account_id"] = os.environ["OPENAI_REVIEWER_SERVICE_ACCOUNT_ID"]
+    from openai.auth import WorkloadIdentityAuth
+
+    # Параметры обмена — только из переменных ревьюера: OPENAI_SERVICE_ACCOUNT_ID
+    # (привязка дымового теста) сюда не передаётся и не нужен (прогон 36518983506).
+    wi = {"identity_provider_id": os.environ["OPENAI_IDENTITY_PROVIDER_ID"],
+          "service_account_id": os.environ["OPENAI_REVIEWER_SERVICE_ACCOUNT_ID"],
+          "provider": {"token_type": "jwt", "get_token": openai_smoke.github_oidc_token}}
+    # Обмен явно и первым: отказ привязки Reviewer-Run виден как отказ обмена,
+    # с claims OIDC-токена (без самого токена) — по ним сверяется привязка.
+    try:
+        WorkloadIdentityAuth(workload_identity=wi).get_token()
+        print("Reviewer-Run token exchange: PASS (token not printed)")
+    except Exception as exc:
+        try:
+            claims = json.dumps(openai_smoke.oidc_claims(), ensure_ascii=False)
+        except Exception as cexc:
+            claims = "unavailable: " + type(cexc).__name__
+        print(f"Reviewer-Run token exchange: FAIL — {oc.describe(exc)}; OIDC claims: {claims}")
+        raise rl.Unknown("reviewer_run_exchange:" + str(oc.error_code(exc)))
     return OpenAI(workload_identity=wi)
 
 

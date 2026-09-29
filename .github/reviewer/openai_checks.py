@@ -53,7 +53,10 @@ def error_code(exc):
     if code is None:
         body = getattr(exc, "body", None)
         if isinstance(body, dict):
-            code = body.get("code") or (body.get("error") or {}).get("code")
+            err = body.get("error")
+            # OAuth (RFC 6749): {"error": "invalid_grant"}; API: {"code": ...}
+            # или {"error": {"code": ...}}.
+            code = body.get("code") or (err if isinstance(err, str) else (err or {}).get("code"))
     return code
 
 
@@ -139,6 +142,25 @@ def check_admin_api_refused(http_get):
     if 200 <= status < 300:
         return FAIL, f"GET /v1/organization/projects -> {status}: the WIF token reaches the Admin API"
     return UNKNOWN, f"GET /v1/organization/projects -> {status}"
+
+
+def check_foreign_binding_refused(exchange, own_exchange_ok):
+    """(е) Обмен по привязке Reviewer-Run из чужого файла (D-102 §a, D-103 §a).
+
+    Привязка probe-reviewer совпадает только с reviewer.yml@main по
+    workflow_run; из openai-wif-test.yml обмен обязан получить invalid_grant.
+    Засчитывается ТОЛЬКО если свой обмен (б) в этом же прогоне успешен: иначе
+    отказ мог бы быть поломкой запроса, а не привязки. exchange() -> токен.
+    """
+    if not own_exchange_ok:
+        return UNKNOWN, "not judged: own exchange (б) did not succeed in this run"
+    try:
+        exchange()
+    except Exception as exc:
+        if error_code(exc) == "invalid_grant":
+            return PASS, "exchange for Reviewer-Run refused: " + describe(exc)
+        return UNKNOWN, "exchange for Reviewer-Run failed, but not with invalid_grant: " + describe(exc)
+    return FAIL, "exchange for Reviewer-Run SUCCEEDED from openai-wif-test.yml: the binding is not limited to reviewer.yml"
 
 
 def boundary_checks(client, expected):
