@@ -1,0 +1,110 @@
+# Выпуск токена приложения ревьюера с подмножеством прав установки
+# (D-103 §e, D-104 §b; разведка 3.2). Установка online-base1-reviewer имеет
+# contents:read, issues:write, pull_requests:read на probe и factory-knowledge.
+#
+#   (1) POST /app/installations/{id}/access_tokens с repositories=[factory-knowledge],
+#       permissions={contents:read} — выдаётся ли и какие permissions и
+#       repositories в ОТВЕТЕ (печатается ответ без поля token);
+#   (2) этим токеном: чтение factory-knowledge — 200 (положительная пара);
+#       комментарий в служебную issue #3 — обязан 403 (права issues в токене нет);
+#       комментарий в канареечную заявку probe#34 — обязан 403/404 (probe в
+#       токене не назван);
+#   (3) запрос права сверх установки (contents:write) — обязан 422.
+# Все выданные токены отзываются в конце. Токены и JWT не печатаются.
+name: reviewer-app-token-test
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: reviewer-app-token-test
+  cancel-in-progress: false
+
+jobs:
+  subset:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Subset token from the reviewer installation
+        shell: bash
+        env:
+          APP_KEY: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          CLIENT_ID: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -uo pipefail
+          [ -n "$APP_KEY" ] && [ -n "$CLIENT_ID" ] || { echo "::error::reviewer app is not configured"; exit 1; }
+          key="$(mktemp)"; chmod 600 "$key"; printf '%s\n' "$APP_KEY" > "$key"
+          tokens=()
+          cleanup() {
+            for t in "${tokens[@]}"; do
+              curl -sS -o /dev/null -X DELETE -H "Authorization: Bearer $t" https://api.github.com/installation/token || true
+            done
+            rm -f "$key"
+          }
+          trap cleanup EXIT
+          b64() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now=$(date +%s)
+          jwt="$(printf '{"alg":"RS256","typ":"JWT"}' | b64).$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now-60)) $((now+300)) "$CLIENT_ID" | b64)"
+          jwt="$jwt.$(printf '%s' "$jwt" | openssl dgst -sha256 -sign "$key" -binary | b64)"
+          echo "::add-mask::$jwt"
+          api() { curl -sS -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "$@"; }
+
+          inst="$(api -H "Authorization: Bearer $jwt" https://api.github.com/app/installations | jq -r --arg o "$OWNER" '.[] | select(.account.login == $o) | .id')"
+          echo "installation: $inst"
+          api -H "Authorization: Bearer $jwt" "https://api.github.com/app/installations/$inst" | jq -c '{permissions, repository_selection}' | sed 's/^/installation permissions: /'
+
+          red=0
+          # (1) подмножество
+          resp="$(api -w '\n%{http_code}' -X POST -H "Authorization: Bearer $jwt" \
+            "https://api.github.com/app/installations/$inst/access_tokens" \
+            -d '{"repositories":["factory-knowledge"],"permissions":{"contents":"read"}}')"
+          code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+          t="$(printf '%s' "$body" | jq -r '.token // empty')"
+          [ -n "$t" ] && { echo "::add-mask::$t"; tokens+=("$t"); }
+          echo "(1) access_tokens subset -> HTTP $code; response without token:"
+          printf '%s' "$body" | jq -c 'del(.token) | {expires_at, permissions, repository_selection, repositories: [.repositories[]?.full_name]}' | sed 's/^/    /'
+          perms="$(printf '%s' "$body" | jq -c '.permissions // {} | to_entries | map(.key + ":" + .value) | sort')"
+          repos="$(printf '%s' "$body" | jq -c '[.repositories[]?.full_name] | sort')"
+          if [ "$code" = 201 ] && [ "$perms" = '["contents:read","metadata:read"]' ] && [ "$repos" = "[\"$OWNER/factory-knowledge\"]" ]; then
+            echo "(1) PASS: token issued with exactly contents:read (+metadata:read) on factory-knowledge only"
+          else
+            echo "::error::(1) FAIL: subset token — HTTP $code, permissions $perms, repositories $repos"; red=1
+          fi
+
+          if [ -n "$t" ]; then
+            # (2) положительная и отрицательная пары этим токеном
+            c="$(api -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $t" "https://api.github.com/repos/$OWNER/factory-knowledge/contents/README.md")"
+            [ "$c" = 200 ] && echo "(2+) PASS: read factory-knowledge README -> 200" || { echo "::error::(2+) FAIL: read -> $c"; red=1; }
+            c="$(api -o /tmp/c.json -w '%{http_code}' -X POST -H "Authorization: Bearer $t" \
+              "https://api.github.com/repos/$OWNER/factory-knowledge/issues/3/comments" -d '{"body":"reviewer subset token probe — must be refused"}')"
+            if [ "$c" = 403 ]; then echo "(2-) PASS: comment in factory-knowledge#3 -> 403 ($(jq -r .message /tmp/c.json))"
+            else
+              echo "::error::(2-) FAIL: comment -> $c"; red=1
+              cid="$(jq -r '.id // empty' /tmp/c.json)"; [ -n "$cid" ] && api -o /dev/null -X DELETE -H "Authorization: Bearer $t" "https://api.github.com/repos/$OWNER/factory-knowledge/issues/comments/$cid"
+            fi
+            # probe публичный — чтение ничего не доказывает; запись в мишень
+            # (канареечная заявка #34) токеном, выпущенным на factory-knowledge.
+            c="$(api -o /tmp/c2.json -w '%{http_code}' -X POST -H "Authorization: Bearer $t" \
+              "https://api.github.com/repos/$OWNER/probe/issues/34/comments" -d '{"body":"reviewer subset token probe — must be refused"}')"
+            case "$c" in
+              403|404) echo "(2-) PASS: comment in probe#34 with the factory-knowledge token -> $c ($(jq -r .message /tmp/c2.json))" ;;
+              *) echo "::error::(2-) FAIL: comment in probe#34 -> $c"; red=1
+                 cid="$(jq -r '.id // empty' /tmp/c2.json)"; [ -n "$cid" ] && api -o /dev/null -X DELETE -H "Authorization: Bearer $t" "https://api.github.com/repos/$OWNER/probe/issues/comments/$cid" ;;
+            esac
+          fi
+
+          # (3) право сверх установки
+          resp="$(api -w '\n%{http_code}' -X POST -H "Authorization: Bearer $jwt" \
+            "https://api.github.com/app/installations/$inst/access_tokens" -d '{"permissions":{"contents":"write"}}')"
+          code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+          t3="$(printf '%s' "$body" | jq -r '.token // empty')"
+          [ -n "$t3" ] && { echo "::add-mask::$t3"; tokens+=("$t3"); }
+          echo "(3) access_tokens contents:write -> HTTP $code: $(printf '%s' "$body" | jq -c 'del(.token) | {message, permissions}')"
+          if [ "$code" = 422 ]; then echo "(3) PASS: permission beyond the installation is refused"
+          else echo "::error::(3) FAIL: expected 422, got $code"; red=1; fi
+
+          exit "$red"

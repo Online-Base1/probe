@@ -80,12 +80,35 @@ class Workflows(unittest.TestCase):
         self.assertEqual((rl.PROMPT_PATH, rl.FORMAT_PATH), ("prompts/05-review.md", "standards/findings-format.md"))
         self.assertIn("if: ${{ !startsWith(github.head_ref, 'agent/') }}", t)
 
-    def test_canary_trigger_does_nothing_else(self):
+    def test_canary_trigger_snapshot_and_push_probe(self):
         t = read("canary-trigger.yml")
         self.assertRegex(t, r"(?m)^permissions: \{\}$")
-        self.assertNotIn("secrets.", t)
         self.assertNotIn("actions/checkout", t)
         self.assertIn(rl.CANARY_EXPECTED["file"], t)
+        snap = job_block(t, "snapshot")
+        self.assertNotIn("secrets.", snap)
+        probe = job_block(t, "push-probe")
+        # Только ключ исполнителя и только contents:write на probe; ключа ревьюера здесь нет.
+        self.assertEqual(re.findall(r"secrets\.[A-Z_]+", t), ["secrets.FACTORY_APP_PRIVATE_KEY"])
+        self.assertEqual(re.findall(r"permission-[a-z-]+: \w+", probe), ["permission-contents: write"])
+        self.assertIn('grep -q "GH013"', probe)
+        self.assertIn("refs/heads/canary/known-defect", probe)
+        self.assertIn("--allow-empty", probe)
+        self.assertLess(probe.index("fetch -q --depth 1"), probe.index('g push "$url"'))
+
+    def test_reviewer_has_no_worker_key(self):
+        self.assertNotIn("FACTORY_APP_PRIVATE_KEY", read("reviewer.yml"))
+
+    def test_report_permissions(self):
+        r = job_block(read("reviewer.yml"), "report")
+        self.assertIn("permissions:\n      actions: read\n      contents: read\n", r)
+
+    def test_subset_token_test(self):
+        t = read("reviewer-app-token-test.yml")
+        self.assertIn('{"repositories":["factory-knowledge"],"permissions":{"contents":"read"}}', t)
+        self.assertIn("del(.token)", t)
+        self.assertIn("trap cleanup EXIT", t)
+        self.assertRegex(t, r"(?m)^  workflow_dispatch:$")
 
 
 if __name__ == "__main__":

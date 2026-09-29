@@ -18,8 +18,10 @@
 #             (задание, дифф, статусы гейтов — без body, title и сообщений
 #             коммитов), ответ по схеме, usage > 0, комментарий с маркером head_sha.
 #   report  — REVIEW_RESULT=DONE|AGENT_RUN_INCOMPLETE(..)|UNKNOWN(..), FINDINGS,
-#             PROMPT_SHA, FORMAT_SHA, MODEL, CANARY и строка REVIEW_RECORD
-#             фиксированного вида (D-106 §e); UNKNOWN и CANARY=FAIL — красный.
+#             PROMPT_SHA, FORMAT_SHA, MODEL, CANARY, RETENTION и строка учёта
+#             REVIEW_LEDGER фиксированного вида — в сводку и в журнал (D-106 §e,
+#             D-107 §a); проба срока хранения журналов — в каждом прогоне
+#             (D-108). UNKNOWN, CANARY=FAIL и retention=failed — красный.
 #
 # Ключ «уже ревьюили» — PR + head SHA, для канарейки ещё run_id прогона
 # canary-trigger (D-105 §a); concurrency — по PR + head SHA.
@@ -161,7 +163,10 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # actions:read — проба срока хранения: журнал своего прогона возрастом
+    # >= N дней (D-107 §c, D-108). Больше прав не нужно и не выдаётся.
     permissions:
+      actions: read
       contents: read
     steps:
       - name: Checkout reviewer code (main)
@@ -174,6 +179,8 @@ jobs:
       - name: REVIEW_RESULT
         shell: bash
         env:
+          GH_TOKEN_READ: ${{ github.token }}
+          REPO: ${{ github.repository }}
           RESOLVE_JOB_RESULT: ${{ needs.resolve.result }}
           RESOLVE_OUTCOME: ${{ needs.resolve.outputs.outcome }}
           RESOLVE_REASON: ${{ needs.resolve.outputs.reason }}

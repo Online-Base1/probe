@@ -8,9 +8,12 @@
 GitHub/transport и фабрику клиента OpenAI: в тестах они подменяются.
 """
 
+import datetime
+import io
 import json
 import os
 import sys
+import zipfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -245,7 +248,49 @@ def review(ctx):
     return st
 
 
-def report(env):
+def run_log_text(gh, repo, run_id):
+    """Журнал прогона (zip) текстом; (HTTP-статус, текст). Токен дальше редиректа не идёт."""
+    status, headers, data = gh.request("GET", f"/repos/{repo}/actions/runs/{run_id}/logs")
+    if status in (301, 302, 303, 307, 308):
+        location = headers.get("Location") or headers.get("location")
+        if not location:
+            return 0, ""
+        status, _, data = gh.transport("GET", location, {"User-Agent": "factory-reviewer"}, None)
+    if status != 200:
+        return status, ""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            return 200, "\n".join(zf.read(n).decode("utf-8", errors="replace") for n in zf.namelist() if not n.endswith("/"))
+    except zipfile.BadZipFile:
+        return 0, ""
+
+
+def retention_probe(gh, repo, now, current_run_id):
+    """Проба срока хранения в каждом прогоне (D-107 §c, D-108 §b–§c) → (итог, подробность).
+
+    Положительная пара: журнал последнего завершённого своего прогона обязан
+    читаться этим же токеном (actions:read). Иначе отрицательный исход
+    «старый журнал не читается» ничего бы не доказывал — и это тоже failed.
+    """
+    base = f"/repos/{repo}/actions/workflows/{rl.REVIEWER_WORKFLOW_FILE}/runs?status=completed"
+    try:
+        recent = [r for r in gh.json(base + "&per_page=5", "runs")["workflow_runs"] if str(r["id"]) != str(current_run_id)]
+        if recent:
+            st, _ = run_log_text(gh, repo, recent[0]["id"])
+            if st != 200:
+                return rl.RETENTION_FAILED, f"positive control: log of recent run {recent[0]['id']} -> HTTP {st} (actions:read not enough?)"
+        cutoff = (now - datetime.timedelta(days=rl.RETENTION_PROBE_DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old = gh.json(base + f"&created=%3C%3D{cutoff}&per_page=1", "old_runs")["workflow_runs"]
+    except rl.Unknown as exc:
+        return rl.RETENTION_FAILED, "runs list: " + exc.reason
+    if not old:
+        return rl.retention_verdict(None, None, None, now), f"no own run older than {rl.RETENTION_PROBE_DAYS} days (cutoff {cutoff})"
+    st, text = run_log_text(gh, repo, old[0]["id"])
+    verdict = rl.retention_verdict(old[0], st, text, now)
+    return verdict, f"run {old[0]['id']} created {old[0]['created_at']}: log HTTP {st}"
+
+
+def report(env, gh=None, now=None):
     """Итог прогона ревьюера из выходов resolve и review. Возвращает (строки, код)."""
     outcome, reason = env.get("RESOLVE_OUTCOME", ""), env.get("RESOLVE_REASON", "")
     trigger = env.get("RESOLVE_TRIGGER", "")
@@ -266,10 +311,16 @@ def report(env):
         canary = env.get("REVIEW_CANARY") or canary
     else:
         result = rl.result_line(rl.UNKNOWN_KIND, "resolve_job_" + (env.get("RESOLVE_JOB_RESULT") or "none"))
+    now = now or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    if gh is not None:
+        retention, detail = retention_probe(gh, env.get("REPO", ""), now, env.get("GITHUB_RUN_ID", ""))
+    else:
+        retention, detail = rl.RETENTION_NOT_OBSERVED, "retention probe not run"
+    print(f"retention probe: {retention} — {detail}")
     lines = rl.summary_lines(result, findings, prompt_sha, model, canary, kind=trigger,
                              pr=env.get("RESOLVE_PR", ""), head_sha=env.get("RESOLVE_HEAD_SHA", ""),
-                             format_sha=format_sha)
-    red = result.startswith(rl.UNKNOWN_KIND) or canary == "FAIL"
+                             format_sha=format_sha, run_date=now.date().isoformat(), retention=retention)
+    red = result.startswith(rl.UNKNOWN_KIND) or canary == "FAIL" or retention == rl.RETENTION_FAILED
     return lines, 1 if red else 0
 
 
@@ -333,7 +384,7 @@ def main(argv):
                       "model": st["model"], "canary": st["canary"]})
         return 0
     if cmd == "report":
-        lines, code = report(os.environ)
+        lines, code = report(os.environ, gh=GitHub(os.environ.get("GH_TOKEN_READ", "")))
         print("\n".join(lines))
         _summary(lines)
         return code

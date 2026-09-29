@@ -28,10 +28,23 @@ D-098, D-099, D-101, D-102, D-103. Промпт и формат пишет «А�
 - Ключ «уже ревьюили» для канарейки — PR + head SHA + `run_id` прогона `canary-trigger`: иначе со второй ночи пропуск выглядел бы успехом.
 - Канарейка доказывает, что путь жив и ревьюер видит очевидное. Она **не** доказывает, что он хорошо ищет дефекты (D-105 §e).
 
-## Заглушки до ввода
+## Учёт и срок хранения (D-106 §e, D-107, D-108)
 
-- `vars.FACTORY_REVIEWER_APP_CLIENT_ID` и `secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY` — приложение `online-base1-reviewer`.
-- `vars.OPENAI_REVIEWER_SERVICE_ACCOUNT_ID` — привязка `Reviewer-Run`.
-- `CANARY_PR` — постоянная черновая заявка `canary/known-defect`; `WRITE_PROBE_ISSUE` — служебная issue «reviewer-write-probe» в `factory-knowledge`. Обе — константы в `reviewer_lib.py`.
+- Итог каждого прогона — одна строка фиксированного вида, в сводку и в журнал:
+  `REVIEW_LEDGER kind= pr= head= run_date= expires= retention= result= findings= prompt_sha= format_sha= model= canary= d086=`.
+  Порядок полей не меняется: из этих строк учёт наполняется задним числом. У канарейки `d086=excluded`.
+- Проба срока хранения выполняется в каждом прогоне (`report`, `actions:read`):
+  - положительная пара — журнал последнего завершённого своего прогона читается;
+  - затем свой прогон возрастом ≥ N = 90 − 7 дней:
+    - такого прогона нет — `retention=not_observed`, `expires=not_observed`, не краснеет;
+    - журнал читается и в нём есть строка — `retention=observed=<дни>d`, `expires = run_date + наблюдённые дни`;
+    - прогон есть, а журнал или строка не читаются — `retention=failed`, **красный**.
+- Ротация канареечных комментариев выключена до появления учёта: `LEDGER_AVAILABLE = False`, ревьюер ничего не удаляет.
 
-Пока заглушки не заменены, `reviewer.yml` и `reviewer-ci / prompt-present` красные. Так и должно быть.
+## Константы
+
+- `CANARY_PR = 34` — `canary/known-defect` → `canary-base`, ruleset `canary-protection`.
+- `WRITE_PROBE_ISSUE = 3` — `factory-knowledge#3` «reviewer-write-probe».
+- Канарейка определяется только номером `CANARY_PR` и прогоном `canary-trigger.yml`.
+- Ночная проба push worker-токеном в `canary/known-defect` (обязан `GH013`) — job `push-probe` в `canary-trigger.yml`.
+- Остаётся заглушкой: `vars.OPENAI_REVIEWER_SERVICE_ACCOUNT_ID` (привязка `Reviewer-Run`). Пока её нет, ревью заканчивается `UNKNOWN(not_configured:…)`.
