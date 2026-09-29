@@ -16,6 +16,11 @@
 # чтение той же ветки тем же токеном. Проба живёт здесь, а не в reviewer.yml:
 # ключ исполнителя в workflow ревьюера не попадает. Её провал делает прогон
 # красным, и ревьюер видит это как UNKNOWN(canary_trigger_conclusion:failure).
+#
+# ff-probe (D-110 §e(в), повторяемая): worker-токен в тестовой ветке
+# agent/canary-ff-probe — fast-forward push обязан пройти (положительная
+# пара), push --force переписанной истории обязан получить GH013 от ruleset
+# на agent/**. Ветка пишется только пустыми коммитами.
 name: canary-trigger
 
 on:
@@ -115,4 +120,71 @@ jobs:
           else
             echo "::error::worker push failed, but not with GH013 for canary/known-defect (UNKNOWN): the refusal is not the ruleset"
             exit 1
+          fi
+
+  ff-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Mint worker token (probe, contents:write)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Worker force-push to agent/canary-ff-probe is refused (GH013)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # bash -e раннера иначе завершит шаг молча на ожидаемо неудачном push.
+          set +e
+          set -uo pipefail
+          branch=agent/canary-ff-probe
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          url="https://github.com/$REPO"
+          g() { git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" "$@"; }
+          d="$(mktemp -d)"; cd "$d"
+          git init -q && git config user.name "agent ff probe" && git config user.email "noreply@example.invalid"
+
+          if [ -z "$(g ls-remote "$url" "refs/heads/$branch")" ]; then
+            g fetch -q --depth 1 "$url" refs/heads/main && git checkout -q FETCH_HEAD
+            if ! g push -q "$url" "HEAD:refs/heads/$branch"; then
+              echo "::error::cannot create $branch with the worker token"; exit 1
+            fi
+            echo "created $branch at $(git rev-parse HEAD)"
+          fi
+          if ! g fetch -q --depth 1 "$url" "refs/heads/$branch"; then
+            echo "::error::worker token cannot fetch $branch"; exit 1
+          fi
+          git checkout -q FETCH_HEAD
+          tip="$(git rev-parse HEAD)"
+
+          # Положительная пара: обычный fast-forward push проходит.
+          git commit -q --allow-empty -m "ff probe: fast-forward (must be accepted)"
+          out="$(g push "$url" "HEAD:refs/heads/$branch" 2>&1)"; code=$?
+          echo "fast-forward push exit code: $code"; echo "$out" | sed 's/^/  | /'
+          if [ "$code" != 0 ]; then
+            echo "::error::fast-forward push to $branch was refused: the negative probe below would prove nothing"; exit 1
+          fi
+          ff="$(git rev-parse HEAD)"
+
+          # Отрицательная: переписанная история (новый коммит на месте ff) с --force.
+          git reset -q --hard "$tip"
+          git commit -q --allow-empty -m "ff probe: rewritten history (must be refused)"
+          out="$(g push --force "$url" "HEAD:refs/heads/$branch" 2>&1)"; code=$?
+          echo "force push exit code: $code"; echo "$out" | sed 's/^/  | /'
+          if [ "$code" = 0 ]; then
+            echo "::error::worker force-push to $branch was ACCEPTED ($ff rewritten): agent/** history is not protected"; exit 1
+          fi
+          if echo "$out" | grep -q "GH013" && echo "$out" | grep -q "refs/heads/$branch"; then
+            echo "force-push refused by a repository rule (GH013), as required; $branch stays at $ff"
+          else
+            echo "::error::force-push failed, but not with GH013 for $branch (UNKNOWN)"; exit 1
           fi

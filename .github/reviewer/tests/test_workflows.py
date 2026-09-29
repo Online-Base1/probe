@@ -91,7 +91,7 @@ class Workflows(unittest.TestCase):
         self.assertNotIn("secrets.", snap)
         probe = job_block(t, "push-probe")
         # Только ключ исполнителя и только contents:write на probe; ключа ревьюера здесь нет.
-        self.assertEqual(re.findall(r"secrets\.[A-Z_]+", t), ["secrets.FACTORY_APP_PRIVATE_KEY"])
+        self.assertEqual(set(re.findall(r"secrets\.[A-Z_]+", t)), {"secrets.FACTORY_APP_PRIVATE_KEY"})
         self.assertEqual(re.findall(r"permission-[a-z-]+: \w+", probe), ["permission-contents: write"])
         self.assertIn('grep -q "GH013"', probe)
         self.assertIn("refs/heads/canary/known-defect", probe)
@@ -100,6 +100,17 @@ class Workflows(unittest.TestCase):
         self.assertRegex(probe, r"(?m)^          set \+e$")
         self.assertLess(probe.index("set +e"), probe.index('g push "$url"'))
         self.assertLess(probe.index("fetch -q --depth 1"), probe.index('g push "$url"'))
+
+    def test_ff_probe(self):
+        t = read("canary-trigger.yml")
+        probe = job_block(t, "ff-probe")
+        self.assertIn("branch=agent/canary-ff-probe", probe)
+        self.assertEqual(re.findall(r"permission-[a-z-]+: \w+", probe), ["permission-contents: write"])
+        self.assertRegex(probe, r"(?m)^          set \+e$")
+        # положительная пара раньше отрицательной, и отказ сверяется по GH013
+        self.assertLess(probe.index("fast-forward (must be accepted)"), probe.index('g push --force "$url"'))
+        self.assertIn('grep -q "GH013"', probe)
+        self.assertEqual(re.findall(r"secrets\.[A-Z_]+", t), ["secrets.FACTORY_APP_PRIVATE_KEY"] * 2)
 
     def test_reviewer_has_no_worker_key(self):
         self.assertNotIn("FACTORY_APP_PRIVATE_KEY", read("reviewer.yml"))

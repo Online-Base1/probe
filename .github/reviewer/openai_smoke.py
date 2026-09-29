@@ -3,6 +3,8 @@
   (а) ключей OPENAI_API_KEY / ANTHROPIC_API_KEY / OPENAI_ADMIN_KEY в окружении нет;
   (б) обмен OIDC-токена GitHub на токен OpenAI успешен;
   (в)–(д) — openai_checks.boundary_checks;
+  (е) обмен по привязке Reviewer-Run отсюда → только invalid_grant, и только
+      при успешном (б) в этом же прогоне;
   (ж) токен не администраторский — проба области (D-109 §d). Состав WIF-привязок
       этим не наблюдается: допущение «состав WIF-привязок не наблюдаем» остаётся.
 
@@ -31,6 +33,16 @@ def github_oidc_token():
     if not value:
         raise RuntimeError("GitHub did not issue an OIDC token")
     return value
+
+
+def oidc_claims():
+    """Claims OIDC-токена GitHub для диагностики отказа обмена — без самого токена."""
+    import base64
+    payload = github_oidc_token().split(".")[1]
+    data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    keys = ("iss", "aud", "sub", "repository", "repository_id", "repository_owner_id", "ref",
+            "workflow_ref", "job_workflow_ref", "event_name", "run_id")
+    return {k: data.get(k) for k in keys}
 
 
 def workload_identity():
@@ -94,6 +106,15 @@ def main():
     except Exception as exc:
         record("(б) token exchange", oc.FAIL, oc.describe(exc))
         exchanged = False
+
+    # (е) — сразу после (б): отказ засчитывается только в паре с успешным (б).
+    reviewer_sa = os.environ.get("OPENAI_REVIEWER_SERVICE_ACCOUNT_ID", "")
+    if reviewer_sa:
+        wi_rev = dict(wi, service_account_id=reviewer_sa)
+        record("(е) Reviewer-Run binding refused here",
+               *oc.check_foreign_binding_refused(lambda: WorkloadIdentityAuth(workload_identity=wi_rev).get_token(), exchanged))
+    else:
+        record("(е) Reviewer-Run binding refused here", oc.UNKNOWN, "OPENAI_REVIEWER_SERVICE_ACCOUNT_ID is not set")
 
     if exchanged:
         for name, verdict, detail in oc.boundary_checks(OpenAI(workload_identity=wi), expected):

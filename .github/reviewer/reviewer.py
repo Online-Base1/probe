@@ -347,8 +347,22 @@ def _openai_factory():
     import openai_smoke
     from openai import OpenAI
 
+    from openai.auth import WorkloadIdentityAuth
+
     wi = openai_smoke.workload_identity()
     wi["service_account_id"] = os.environ["OPENAI_REVIEWER_SERVICE_ACCOUNT_ID"]
+    # Обмен явно и первым: отказ привязки Reviewer-Run виден как отказ обмена,
+    # с claims OIDC-токена (без самого токена) — по ним сверяется привязка.
+    try:
+        WorkloadIdentityAuth(workload_identity=wi).get_token()
+        print("Reviewer-Run token exchange: PASS (token not printed)")
+    except Exception as exc:
+        try:
+            claims = json.dumps(openai_smoke.oidc_claims(), ensure_ascii=False)
+        except Exception as cexc:
+            claims = "unavailable: " + type(cexc).__name__
+        print(f"Reviewer-Run token exchange: FAIL — {oc.describe(exc)}; OIDC claims: {claims}")
+        raise rl.Unknown("reviewer_run_exchange:" + str(oc.error_code(exc)))
     return OpenAI(workload_identity=wi)
 
 

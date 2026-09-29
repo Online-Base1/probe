@@ -142,6 +142,41 @@ class AdminApi(unittest.TestCase):
         self.assertEqual(oc.ADMIN_PROBE_URL, "https://api.openai.com/v1/organization/projects?limit=1")
 
 
+class ForeignBinding(unittest.TestCase):
+    """(е) обмен по привязке Reviewer-Run из openai-wif-test.yml."""
+
+    @staticmethod
+    def oauth(code, status=401):
+        e = ApiError(status, None)
+        e.code = None
+        e.body = {"error": code, "error_description": "The provided service_account_id mapping does not match token attributes."}
+        return e
+
+    def raising(self, exc):
+        def f():
+            raise exc
+        return f
+
+    def test_invalid_grant_with_own_ok(self):
+        self.assertEqual(oc.check_foreign_binding_refused(self.raising(self.oauth("invalid_grant")), True)[0], oc.PASS)
+
+    def test_invalid_grant_without_own_ok_is_unknown(self):
+        self.assertEqual(oc.check_foreign_binding_refused(self.raising(self.oauth("invalid_grant")), False)[0], oc.UNKNOWN)
+
+    def test_success_is_fail(self):
+        self.assertEqual(oc.check_foreign_binding_refused(lambda: "tok", True)[0], oc.FAIL)
+
+    def test_other_error_is_unknown(self):
+        for e in (self.oauth("invalid_client"), self.oauth("server_error", 500), TimeoutError("t"), ApiError(403, "model_not_found")):
+            with self.subTest(e=e):
+                self.assertEqual(oc.check_foreign_binding_refused(self.raising(e), True)[0], oc.UNKNOWN)
+
+    def test_not_called_without_own_ok(self):
+        called = []
+        oc.check_foreign_binding_refused(lambda: called.append(1), False)
+        self.assertEqual(called, [])
+
+
 class Boundary(unittest.TestCase):
     def test_all_pass(self):
         self.assertEqual([v for _, v, _ in oc.boundary_checks(default_client(), EXPECTED)], [oc.PASS] * 3)
