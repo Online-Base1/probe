@@ -17,7 +17,7 @@ jobs:
   gates:
     permissions:
       contents: read
-    uses: Online-Base1/factory-ci/.github/workflows/gates.yml@62f46fffe994383ff7f27420c95f7615aef35192
+    uses: Online-Base1/factory-ci/.github/workflows/gates.yml@327d7a140c00a2eb72095310bde7e6d2c7dd2b47
     with:
       node-version: "22"
       run-e2e: true
