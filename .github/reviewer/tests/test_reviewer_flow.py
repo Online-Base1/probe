@@ -501,6 +501,81 @@ class Retention(unittest.TestCase):
         self.assertFalse(any(self.w.redirect_auth))
 
 
+class OpenAIFactory(unittest.TestCase):
+    """_openai_factory не зависит от переменных дымового теста (прогон 36518983506)."""
+
+    def test_uses_only_reviewer_variables(self):
+        import types
+        seen = {}
+
+        class Auth:
+            def __init__(self, workload_identity):
+                seen["wi"] = workload_identity
+
+            def get_token(self):
+                return "tok"
+
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = lambda workload_identity: ("client", workload_identity["service_account_id"])
+        fake_auth = types.ModuleType("openai.auth")
+        fake_auth.WorkloadIdentityAuth = Auth
+        env = {"OPENAI_IDENTITY_PROVIDER_ID": "idp", "OPENAI_REVIEWER_SERVICE_ACCOUNT_ID": "user-rev", "OPENAI_WIF_AUDIENCE": "aud"}
+        saved_env, saved_mods = dict(os.environ), {k: sys.modules.get(k) for k in ("openai", "openai.auth")}
+        try:
+            os.environ.pop("OPENAI_SERVICE_ACCOUNT_ID", None)
+            os.environ.update(env)
+            sys.modules["openai"], sys.modules["openai.auth"] = fake_openai, fake_auth
+            self.assertEqual(rv._openai_factory(), ("client", "user-rev"))
+            self.assertEqual(seen["wi"]["service_account_id"], "user-rev")
+            self.assertEqual(seen["wi"]["identity_provider_id"], "idp")
+        finally:
+            os.environ.clear(); os.environ.update(saved_env)
+            for k, v in saved_mods.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_refusal_is_unknown_with_code(self):
+        import types
+
+        class Refused(Exception):
+            code = "invalid_grant"
+            status_code = 401
+            body = {"error": "invalid_grant"}
+
+        class Auth:
+            def __init__(self, workload_identity):
+                pass
+
+            def get_token(self):
+                raise Refused("mapping does not match")
+
+        fake_openai = types.ModuleType("openai")
+        fake_openai.OpenAI = lambda workload_identity: None
+        fake_auth = types.ModuleType("openai.auth")
+        fake_auth.WorkloadIdentityAuth = Auth
+        saved_env, saved_mods = dict(os.environ), {k: sys.modules.get(k) for k in ("openai", "openai.auth")}
+        real_claims = rv.openai_smoke.oidc_claims if hasattr(rv, "openai_smoke") else None
+        try:
+            os.environ.update({"OPENAI_IDENTITY_PROVIDER_ID": "idp", "OPENAI_REVIEWER_SERVICE_ACCOUNT_ID": "user-rev", "OPENAI_WIF_AUDIENCE": "aud"})
+            sys.modules["openai"], sys.modules["openai.auth"] = fake_openai, fake_auth
+            import openai_smoke
+            openai_smoke.oidc_claims = lambda: {"workflow_ref": "Online-Base1/probe/.github/workflows/reviewer.yml@refs/heads/main"}
+            with self.assertRaises(rl.Unknown) as cm:
+                rv._openai_factory()
+            self.assertEqual(cm.exception.reason, "reviewer_run_exchange:invalid_grant")
+        finally:
+            os.environ.clear(); os.environ.update(saved_env)
+            for k, v in saved_mods.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+            if real_claims:
+                rv.openai_smoke.oidc_claims = real_claims
+
+
 class Rotation(unittest.TestCase):
     def test_rotation_disabled_until_ledger(self):
         deleted = []
