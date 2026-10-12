@@ -90,16 +90,37 @@ def previous_digest(gh, repo, run_id, created):
     return None
 
 
-def checks_commits(gh, repo, start, end):
-    """Коммиты на main, затронувшие .github/, за окно."""
+def checks_commits(gh, repo, start, end, path=dl.CHECKS_PATH):
+    """Коммиты на main за окно (по умолчанию — затронувшие .github/)."""
     q = urllib.parse.quote
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    commits = get_pages(gh, f"/repos/{repo}/commits?path={dl.CHECKS_PATH}&sha=main"
+    only = f"path={path}&" if path else ""
+    commits = get_pages(gh, f"/repos/{repo}/commits?{only}sha=main"
                             f"&since={q(start.strftime(fmt))}&until={q(end.strftime(fmt))}",
                         f"contents:read на {dl.short(repo)}")
     if isinstance(commits, dl.Missing):
         return commits
     return [{"sha": c["sha"], "date": c["commit"]["committer"]["date"]} for c in commits]
+
+
+def merges_of(gh, repo, start, end):
+    """Вливания в main за окно (D-137 §b): коммиты, их заявки и merged_by.
+
+    Окно — по дате коммиттера: у squash-вливания это время вливания. Прямой
+    push старого коммита с ранней датой в окно не попадёт — предел способа.
+    """
+    commits = checks_commits(gh, repo, start, end, path="")
+    if isinstance(commits, dl.Missing):
+        if "HTTP 404" in commits.reason:
+            commits = dl.Missing("репозиторий не виден токену (HTTP 404)")
+        return {"commits": commits, "pulls": {}, "pull_detail": None}
+    pulls = {c["sha"]: get(gh, f"/repos/{repo}/commits/{c['sha']}/pulls", f"pull-requests:read на {dl.short(repo)}")
+             for c in commits}
+
+    def pull_detail(number):
+        return get(gh, f"/repos/{repo}/pulls/{number}", f"pull-requests:read на {dl.short(repo)}")
+
+    return {"commits": commits, "pulls": pulls, "pull_detail": pull_detail}
 
 
 def last_commit_date(gh, repo, path, right):
@@ -191,6 +212,7 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
         "standards_last": last_commit_date(gh_knowledge, rl.KNOWLEDGE_REPO, dl.STANDARDS_PATH,
                                            "contents:read на factory-knowledge"),
         "checks": {repo: checks_commits(tokens[repo], repo, start, end) for repo in dl.CHECKS_REPOS},
+        "merges": {repo: merges_of(tokens[repo], repo, start, end) for repo in dl.MERGES_REPOS},
     }
 
 
