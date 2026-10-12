@@ -53,7 +53,7 @@ class Workflows(unittest.TestCase):
         self.assertIn("if: needs.resolve.outputs.outcome == 'REVIEW'", r)
 
     def test_no_untrusted_expressions_in_run(self):
-        for name in ("reviewer.yml", "reviewer-ci.yml", "canary-trigger.yml"):
+        for name in ("reviewer.yml", "reviewer-ci.yml", "canary-trigger.yml", "digest.yml"):
             t = read(name)
             self.assertNotRegex(t, r"github\.event\.(pull_request|workflow_run)\.(title|body|head_commit|display_title)", name)
 
@@ -118,6 +118,41 @@ class Workflows(unittest.TestCase):
     def test_report_permissions(self):
         r = job_block(read("reviewer.yml"), "report")
         self.assertIn("permissions:\n      actions: read\n      contents: read\n", r)
+
+    def test_digest_trigger_is_own_schedule(self):
+        # D-121 §c: не job ночного прогона и не workflow_run от него — сводка
+        # обязана выйти и тогда, когда ночной прогон не запустился.
+        t = read("digest.yml")
+        on = t[t.index("\non:\n"):t.index("\npermissions:")]
+        self.assertEqual(re.findall(r"(?m)^  ([a-z_]+):", on), ["schedule", "workflow_dispatch"])
+        self.assertNotIn("workflow_run", t.split("\nname: digest\n", 1)[1])
+        self.assertRegex(t, r"(?m)^permissions: \{\}$")
+        self.assertNotIn("digest", read("canary-trigger.yml"))
+        canary = re.search(r'cron: "(\d+) (\d+) \* \* \*"', read("canary-trigger.yml")).groups()
+        digest = re.search(r'cron: "(\d+) (\d+) \* \* \*"', t).groups()
+        self.assertEqual(int(digest[1]) * 60 + int(digest[0]), int(canary[1]) * 60 + int(canary[0]) + 30)
+
+    def test_digest_token_scopes(self):
+        t = read("digest.yml")
+        issues = t[t.index("Mint reviewer token (factory-knowledge, issues:write)"):t.index("Mint reviewer token (factory-knowledge, contents:read)")]
+        self.assertIn("repositories: factory-knowledge", issues)
+        self.assertEqual(re.findall(r"permission-[a-z-]+: \w+", issues), ["permission-issues: write"])
+        self.assertNotIn("continue-on-error", issues)
+        fk = t[t.index("Mint reviewer token (factory-knowledge, contents:read)"):t.index("- name: Digest\n")]
+        self.assertIn("repositories: factory-knowledge", fk)
+        self.assertEqual(re.findall(r"permission-[a-z-]+: \w+", fk), ["permission-contents: read"])
+        job = job_block(t, "digest")
+        self.assertIn("permissions:\n      actions: read\n      contents: read\n      pull-requests: read\n    steps:", job)
+        self.assertEqual(set(re.findall(r"secrets\.[A-Z_]+", t)), {"secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY"})
+        self.assertIn("GH_TOKEN_DIGEST: ${{ steps.issues.outputs.token }}", t)
+
+    def test_no_issue_triggers(self):
+        # Условие D-104 / D-121 §b: по issue и комментариям не запускается ничего,
+        # иначе issues:write приложения ревьюера пересматривается.
+        for name in sorted(os.listdir(WF)):
+            if name.endswith(".yml"):
+                on = read(name).split("\non:", 1)[1].split("\npermissions:", 1)[0]
+                self.assertNotRegex(on, r"(?m)^\s+(issues|issue_comment|discussion|discussion_comment):", name)
 
     def test_subset_token_test(self):
         t = read("reviewer-app-token-test.yml")
