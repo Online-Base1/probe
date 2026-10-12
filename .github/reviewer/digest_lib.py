@@ -14,6 +14,8 @@
 Десятая строка — изменения .github/** за окно по репозиториям (D-134).
 Строка ВЛИВАНИЯ — вливания в main не владельцем и без заявки (D-137): замена
 пробы BB-37 без администраторского права; ОБХОДЫ — другая величина и остаётся.
+Диапазон вливаний — от вершины main, запомненной прошлой сводкой (D-138 b), а
+не по дате коммиттера; ноль без единого запроса — «(запросов не было)» (D-139).
 
 Всё, что приходит из сети, передаётся сюда уже полученным (digest.py); то,
 что получить не удалось, приходит как Missing(причина). Так каждая строка
@@ -49,6 +51,8 @@ CHECKS_REPOS = (PROBE_REPO, FACTORY_CI_REPO, rl.KNOWLEDGE_REPO, ONLINE_BASE_REPO
 # строка ВЛИВАНИЯ, которая печатает владельца каждую ночь.
 OWNER_LOGIN = "MartynPin"
 MERGES_REPOS = CHECKS_REPOS
+# Сравнение отдаёт до 250 коммитов; больше — диапазон не наблюдён целиком.
+COMPARE_LIMIT = 250
 PER_REPO_LINES = {"bypass", "merges", "checks"}
 
 FIRST_WINDOW_HOURS = 24
@@ -92,6 +96,7 @@ MODEL_CHECKS = ("в", "г", "д")
 _UPSTREAM = re.compile(r'"run_id": "(\d+)", "trigger": "(\w*)"')
 _LEDGER = re.compile(r"REVIEW_LEDGER (\S.*)$", re.M)
 _FIELD = re.compile(r"(\w+)=(\S*)")
+_HEADS = re.compile(r"DIGEST_HEADS((?: [\w.-]+=[0-9a-f]{40})*)")
 _MODEL = re.compile(r"\((в|г|д)\) [^:\n]+: (PASS|FAIL|UNKNOWN)\b")
 
 
@@ -167,6 +172,20 @@ def ledger_of(log):
 def model_checks_of(log):
     """Итоги проверок (в)(г)(д) из журнала ревьюера: {'в': 'PASS', ...}."""
     return dict(_MODEL.findall(log or ""))
+
+
+def heads_of(log):
+    """Вершины main, запомненные сводкой (строка DIGEST_HEADS): {репо: sha}; нет строки — None."""
+    found = _HEADS.findall(log or "")
+    if not found:
+        return None
+    return dict(kv.split("=", 1) for kv in found[-1].split())
+
+
+def heads_line(obs):
+    """Вершины main на момент этой сводки — начало диапазона следующей (D-138 b)."""
+    tips = [(short(r), obs["merges"][r]["tip"]) for r in MERGES_REPOS]
+    return "DIGEST_HEADS" + "".join(f" {name}={sha}" for name, sha in tips if isinstance(sha, str))
 
 
 # --- ночной прогон ---
@@ -336,19 +355,49 @@ def merge_verdict(sha, pulls, pull_detail):
     return ("owner" if login == OWNER_LOGIN else "not_owner"), login
 
 
+def merges_range(name, m):
+    """Коммиты, появившиеся в main с прошлой сводки (D-138 b) → (коммиты, пометка).
+
+    Начало — вершина, запомненная прошлой сводкой; нет её (первая сводка с
+    запомненной вершиной) — начало = текущая вершина, коммитов нет, и это
+    сказано. История main не продолжает запомненную вершину — КРАСНЫЙ и
+    «не наблюдалось»: диапазон не определён.
+    """
+    tip = need(m["tip"])
+    base = m["base"]
+    if isinstance(base, Missing):
+        raise NotObserved(f"предыдущая вершина не прочитана: {base.reason}")
+    if base is None:
+        return [], f"запросов не было: начало диапазона — текущая вершина {tip[:7]}, первая сводка с запомненной вершиной"
+    if base == tip:
+        return [], "запросов не было"
+    cmp = need(m["compare"])
+    if cmp.get("status") != "ahead":
+        raise NotObserved(f"КРАСНЫЙ: история main не продолжает запомненную вершину {base[:7]} "
+                          f"(compare {base[:7]}...{tip[:7]}: {cmp.get('status')})")
+    commits = cmp.get("commits") or []
+    total = cmp.get("total_commits", len(commits))
+    if total > len(commits):
+        raise NotObserved(f"в диапазоне {base[:7]}...{tip[:7]} коммитов {total}, получено {len(commits)}")
+    return commits, ("" if commits else "запросов не было")
+
+
 def line_merges(obs):
     """<репозиторий>:<всего>/<не владельцем>/<без заявки> (D-137 §c). Не владельцем
     или без заявки — КРАСНЫЙ с перечнем коммитов; merged_by не прочитался —
     репозиторий «не наблюдалось» и пробел сводки. Факт обнаруживается ПОСЛЕ
-    вливания: это наблюдение, не доказательство невозможности (D-137 §e)."""
+    вливания: это наблюдение, не доказательство невозможности (D-137 §e).
+    Ноль, полученный без единого запроса о заявках, так и называется (D-139)."""
     parts, fields, gaps = [], [], []
     for repo in MERGES_REPOS:
         m, name = obs["merges"][repo], short(repo)
         try:
-            commits = need(m["commits"])
+            commits, note = merges_range(name, m)
             verdicts = []
             for c in commits:
-                pulls = need(m["pulls"].get(c["sha"], Missing(f"заявки коммита {c['sha'][:7]} не запрошены")))
+                pulls = m["pulls"].get(c["sha"], Missing("не запрошены"))
+                if isinstance(pulls, Missing):
+                    raise NotObserved(f"заявки коммита {c['sha'][:7]}: {pulls.reason}")
                 verdicts.append((c["sha"], *merge_verdict(c["sha"], pulls, m["pull_detail"])))
         except NotObserved as exc:
             parts.append(f"{name}: не наблюдалось: {exc.reason}")
@@ -357,7 +406,7 @@ def line_merges(obs):
             continue
         not_owner = [(s, who) for s, v, who in verdicts if v == "not_owner"]
         no_pr = [s for s, v, _ in verdicts if v == "no_pr"]
-        text = f"{name}: {len(verdicts)}/{len(not_owner)}/{len(no_pr)}"
+        text = f"{name}: {len(verdicts)}/{len(not_owner)}/{len(no_pr)}" + (f" ({note})" if note else "")
         red = [f"{s[:7]} без заявки" for s in no_pr] + [f"{s[:7]} влил {who}" for s, who in not_owner]
         if red:
             text += " КРАСНЫЙ: " + ", ".join(red)
@@ -483,6 +532,7 @@ def build(obs, seq):
     last = "СВОДКА ПОЛНАЯ" if not incomplete else "СВОДКА НЕПОЛНАЯ: " + ", ".join(labels)
     body = "\n".join([
         f"<!-- factory-digest seq={seq} date={date} -->",
+        f"<!-- {heads_line(obs)} -->",
         f"**Ночная сводка {date}** · окно {start:%Y-%m-%dT%H:%MZ} … {end:%Y-%m-%dT%H:%MZ} ({note}) · "
         f"прогон сводки {obs['own_run_id']}",
         "",

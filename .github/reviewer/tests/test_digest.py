@@ -48,15 +48,25 @@ def merged_pr(n, sha, base="main"):
     return {"number": n, "merged_at": "2026-10-12T09:00:00Z", "base": {"ref": base}, "merge_commit_sha": sha}
 
 
-def merges_src(commits=(), pulls=None, merged_by=None):
-    """Источник строки ВЛИВАНИЯ: коммиты, их заявки, merged_by по номеру заявки."""
+BASE_SHA, TIP_SHA = "b" * 40, "c" * 40
+
+
+def merges_src(commits=None, pulls=None, merged_by=None, base=BASE_SHA, tip=TIP_SHA, status="ahead", total=None):
+    """Источник строки ВЛИВАНИЯ: вершина, начало диапазона, сравнение, заявки, merged_by.
+
+    commits=None — main не сдвинулся (начало == вершине); Missing — репозиторий не виден.
+    """
     merged_by = merged_by or {}
 
     def detail(n):
         v = merged_by.get(n, dl.OWNER_LOGIN)
         return v if isinstance(v, dl.Missing) else {"number": n, "merged_by": {"login": v} if v else None}
-    return {"commits": list(commits) if not isinstance(commits, dl.Missing) else commits,
-            "pulls": pulls or {}, "pull_detail": detail}
+    if isinstance(commits, dl.Missing):
+        return {"tip": commits, "base": base, "compare": None, "pulls": {}, "pull_detail": None}
+    if commits is None:
+        return {"tip": tip, "base": tip if base == BASE_SHA else base, "compare": None, "pulls": {}, "pull_detail": None}
+    cmp = {"status": status, "commits": list(commits), "total_commits": len(commits) if total is None else total}
+    return {"tip": tip, "base": base, "compare": cmp, "pulls": pulls or {}, "pull_detail": detail}
 
 
 def obs(**over):
@@ -287,9 +297,53 @@ class Merges(unittest.TestCase):
         self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
 
     def test_pulls_unreadable(self):
-        _, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: dl.Missing("HTTP 500")}))
+        body, dline, incomplete = self.build(merges_src(
+            [{"sha": SHA1}], {SHA1: dl.Missing("нет права pull_requests=read (HTTP 403: Resource not accessible by integration)")}))
+        self.assertIn("merges=probe:not_observed,", dline)
+        self.assertIn("probe: не наблюдалось: заявки коммита 1111111: нет права pull_requests=read "
+                      "(HTTP 403: Resource not accessible by integration)", line(body, "ВЛИВАНИЯ"))
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+
+    # --- D-138 b: диапазон от запомненной вершины; D-139 b: ноль без запросов ---
+
+    def test_no_new_commits_says_no_requests(self):
+        body, dline, incomplete = self.build(merges_src())
+        self.assertIn("probe: 0/0/0 (запросов не было);", line(body, "ВЛИВАНИЯ"))
+        self.assertIn("merges=probe:0/0/0,", dline)
+        self.assertEqual(incomplete, [])
+
+    def test_first_with_remembered_tip(self):
+        body, dline, incomplete = self.build(merges_src(base=None))
+        self.assertIn("probe: 0/0/0 (запросов не было: начало диапазона — текущая вершина ccccccc, "
+                      "первая сводка с запомненной вершиной)", line(body, "ВЛИВАНИЯ"))
+        self.assertIn("merges=probe:0/0/0,", dline)
+        self.assertEqual(incomplete, [])
+
+    def test_previous_tip_unreadable(self):
+        body, dline, incomplete = self.build(merges_src(base=dl.Missing("журнал сводки 7: HTTP 410")))
+        self.assertIn("probe: не наблюдалось: предыдущая вершина не прочитана: журнал сводки 7: HTTP 410",
+                      line(body, "ВЛИВАНИЯ"))
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+
+    def test_rewritten_main_is_red_and_gap(self):
+        body, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: [merged_pr(1, SHA1)]}, status="diverged"))
+        self.assertIn("probe: не наблюдалось: КРАСНЫЙ: история main не продолжает запомненную вершину bbbbbbb "
+                      "(compare bbbbbbb...ccccccc: diverged)", line(body, "ВЛИВАНИЯ"))
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+
+    def test_range_truncated_not_observed(self):
+        _, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: [merged_pr(1, SHA1)]}, total=300))
         self.assertIn("merges=probe:not_observed,", dline)
         self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+
+    def test_heads_remembered_in_body(self):
+        m = {r: merges_src() for r in dl.MERGES_REPOS}
+        m[dl.ONLINE_BASE_REPO] = merges_src(dl.Missing("репозиторий не виден токену (HTTP 404)"))
+        body, _, _ = dl.build(obs(merges=m), 1)
+        heads = dl.heads_of(body)
+        self.assertEqual(heads, {"probe": TIP_SHA, "factory-ci": TIP_SHA, "factory-knowledge": TIP_SHA,
+                                 "cost-panel": TIP_SHA})
+        self.assertIsNone(dl.heads_of("REVIEW_LEDGER kind=canary"))
 
     def test_repo_not_visible(self):
         body, dline, incomplete = self.build(merges_src(dl.Missing("репозиторий не виден токену (HTTP 404)")),
@@ -413,7 +467,10 @@ class Flow(unittest.TestCase):
         self.runs = []
         self.digests = []
         self.checks_queries = []
-        self.main_commits = {F.REPO: [{"sha": "f" * 40, "commit": {"committer": {"date": "2026-10-12T09:00:00Z"}}}]}
+        self.main_commits = {F.REPO: [{"sha": "f" * 40}]}
+        self.tips = {F.REPO: "f" * 40}
+        self.compares = []
+        self.digest_logs = {}
         self.commit_pulls = {"f" * 40: [merged_pr(42, "f" * 40)]}
         self.merged_by = "MartynPin"
         self.github_commits = {F.REPO: [{"sha": "f1be53b" + "0" * 33, "commit": {"committer": {"date": "2026-10-12T09:00:00Z"}}}]}
@@ -435,11 +492,24 @@ class Flow(unittest.TestCase):
             return ok({"workflow_runs": self.digests})
         if p == f"/repos/{F.REPO}/actions/runs":
             return ok({"workflow_runs": self.runs if "page=1" in path else []})
-        if p.endswith("/commits") and "path=" not in path:  # вливания в main за окно
-            repo = p[len("/repos/"):-len("/commits")]
+        m_ref = re.fullmatch(r"/repos/([^/]+/[^/]+)/git/ref/heads/main", p)
+        if m_ref:
+            repo = m_ref.group(1)
             if repo in ("Online-Base1/online-base", "Online-Base1/cost-panel") or (repo == F.KR and token != "Bearer k"):
                 return 404, {}, b"{}"
-            return ok(self.main_commits.get(repo, []) if "page=1" in path else [])
+            return ok({"object": {"sha": self.tips.get(repo, TIP_SHA)}})
+        m_cmp = re.fullmatch(r"/repos/([^/]+/[^/]+)/compare/([0-9a-f]{40})\.\.\.([0-9a-f]{40})", p)
+        if m_cmp:
+            self.compares.append(m_cmp.groups())
+            commits = self.main_commits.get(m_cmp.group(1), [])
+            return ok({"status": "ahead", "total_commits": len(commits), "commits": commits})
+        m_log = re.fullmatch(rf"/repos/{F.REPO}/actions/runs/(\d+)/logs", p)
+        if m_log and int(m_log.group(1)) not in self.digest_logs:
+            return 410, {}, b"{}"  # журнал истёк
+        if m_log:
+            return 302, {"Location": f"https://blob.example/logs/{m_log.group(1)}"}, b""
+        if url.startswith("https://blob.example/logs/"):
+            return 200, {}, F.log_zip(self.digest_logs[int(url.rsplit("/", 1)[1])])
         m_pulls = re.fullmatch(r"/repos/([^/]+/[^/]+)/commits/([0-9a-f]{40})/pulls", p)
         if m_pulls:
             return ok(self.commit_pulls.get(m_pulls.group(2), []))
@@ -475,7 +545,7 @@ class Flow(unittest.TestCase):
         self.assertEqual(token, "Bearer d")  # публикует только токен issues:write
         self.assertEqual(posted, body)
         self.assertIn("РЕВЬЮЕР: не наблюдалось: прогона по расписанию не было", posted)
-        self.assertIn("probe: не наблюдалось: нет права administration=read (HTTP 403)", posted)
+        self.assertIn("probe: не наблюдалось: нет права administration=read (HTTP 403: Resource not accessible by integration)", posted)
         self.assertIn("ЖУРНАЛ: не наблюдалось: нет права contents:read на online-base: ресурс не виден токену (HTTP 404)",
                       posted)
         self.assertIn("ПРАВИЛА: 1 дн.", posted)
@@ -488,12 +558,29 @@ class Flow(unittest.TestCase):
         self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 1 (f1be53b); factory-ci: 0; "
                       "factory-knowledge: 0; online-base: не наблюдалось: нет права contents:read на online-base", posted)
         self.assertIn("(первая сводка: окно 24 ч)", posted)
-        self.assertIn("владелец MartynPin — probe: 1/0/0; factory-ci: 0/0/0; factory-knowledge: 0/0/0; "
+        first = "(запросов не было: начало диапазона — текущая вершина {}, первая сводка с запомненной вершиной)"
+        self.assertIn(f"владелец MartynPin — probe: 0/0/0 {first.format('fffffff')}; "
+                      f"factory-ci: 0/0/0 {first.format('ccccccc')}; factory-knowledge: 0/0/0 {first.format('ccccccc')}; "
                       "online-base: не наблюдалось: репозиторий не виден токену (HTTP 404); "
                       "cost-panel: не наблюдалось: репозиторий не виден токену (HTTP 404)", posted)
+        self.assertEqual(self.compares, [])  # без запомненной вершины диапазона нет
+        self.assertEqual(dl.heads_of(posted)["probe"], "f" * 40)
+
+    def remember(self, heads):
+        prev = 38291821501
+        self.digests = [{"id": prev, "created_at": "2026-10-12T08:00:00Z"}]
+        self.digest_logs[prev] = "x <!-- DIGEST_HEADS " + " ".join(f"{k}={v}" for k, v in heads.items()) + " -->\n"
+
+    def test_range_from_remembered_tip(self):
+        self.remember({"probe": "e" * 40, "factory-ci": TIP_SHA})
+        body, code = dg.run(self.env, self.transport, now=NOW)
+        self.assertEqual(self.compares, [(F.REPO, "e" * 40, "f" * 40)])  # factory-ci не сдвинулся — без запроса
+        self.assertIn("probe: 1/0/0; factory-ci: 0/0/0 (запросов не было); factory-knowledge: 0/0/0 (запросов не было: "
+                      "начало диапазона — текущая вершина ccccccc, первая сводка с запомненной вершиной)", body)
 
     def test_merge_by_not_owner_flow(self):
         self.merged_by = WORKER
+        self.remember({"probe": "e" * 40})
         body, code = dg.run(self.env, self.transport, now=NOW)
         self.assertEqual(code, 0)  # сводка отчитывается о наблюдении и выходит зелёной
         self.assertIn(f"probe: 1/1/0 КРАСНЫЙ: fffffff влил {WORKER}", body)
@@ -529,6 +616,7 @@ class Flow(unittest.TestCase):
                         {"id": 38280526382, "created_at": "2026-10-11T16:53:28Z"}]
         body, _ = dg.run(self.env, self.transport, now=NOW)
         self.assertIn("окно 2026-10-11T16:53Z … 2026-10-12T10:47Z (от предыдущей сводки 38280526382)", body)
+        self.assertIn("probe: не наблюдалось: предыдущая вершина не прочитана: журнал сводки 38280526382: HTTP 410", body)
         q = [c[1] for c in self.calls if "/actions/runs?" in c[1]][0]
         self.assertIn("created=%3E%3D2026-10-11T16%3A53%3A28Z", q)
 
