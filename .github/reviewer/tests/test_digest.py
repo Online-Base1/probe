@@ -40,6 +40,25 @@ def run(id_, wf, conclusion="success", event="schedule", status="completed", cre
             "conclusion": conclusion, "created_at": created}
 
 
+SHA1, SHA2 = "1" * 40, "2" * 40
+WORKER = "online-base1-factory-worker[bot]"
+
+
+def merged_pr(n, sha, base="main"):
+    return {"number": n, "merged_at": "2026-10-12T09:00:00Z", "base": {"ref": base}, "merge_commit_sha": sha}
+
+
+def merges_src(commits=(), pulls=None, merged_by=None):
+    """Источник строки ВЛИВАНИЯ: коммиты, их заявки, merged_by по номеру заявки."""
+    merged_by = merged_by or {}
+
+    def detail(n):
+        v = merged_by.get(n, dl.OWNER_LOGIN)
+        return v if isinstance(v, dl.Missing) else {"number": n, "merged_by": {"login": v} if v else None}
+    return {"commits": list(commits) if not isinstance(commits, dl.Missing) else commits,
+            "pulls": pulls or {}, "pull_detail": detail}
+
+
 def obs(**over):
     o = {
         "now": NOW,
@@ -57,6 +76,7 @@ def obs(**over):
         "worklog_last": "2026-10-11T08:00:00Z",
         "standards_last": "2026-10-10T08:00:00Z",
         "checks": {r: [] for r in dl.CHECKS_REPOS},
+        "merges": {r: merges_src() for r in dl.MERGES_REPOS},
     }
     o.update(over)
     return o
@@ -80,9 +100,10 @@ def digest_fields(dline):
 class Shape(unittest.TestCase):
     def assertShape(self, body, dline):
         human = lines_of(body)
-        self.assertEqual([h.split(":", 1)[0] for h in human[:10]], TITLES)
-        self.assertEqual(human[10], "")
-        self.assertEqual(human[11], dline)
+        n = len(TITLES)
+        self.assertEqual([h.split(":", 1)[0] for h in human[:n]], TITLES)
+        self.assertEqual(human[n], "")
+        self.assertEqual(human[n + 1], dline)
         self.assertEqual(digest_fields(dline), list(dl.DIGEST_FIELDS))
         self.assertNotRegex(dline, r"=(\s|$)")
         last = body.rstrip("\n").split("\n")[-1]
@@ -99,7 +120,8 @@ class Shape(unittest.TestCase):
                                 "bypass_30d=probe:1/allowed,factory-knowledge:1/allowed,online-base:1/allowed "
                                 "prless_branch=0 worklog_age=1 models=PASS standards_age=2 "
                                 "checks_changed=probe:0,factory-ci:0,factory-knowledge:0,online-base:0,cost-panel:0 "
-                                "complete=yes")
+                                "complete=yes "
+                                "merges=probe:0/0/0,factory-ci:0/0/0,factory-knowledge:0/0/0,online-base:0/0/0,cost-panel:0/0/0")
         self.assertIn("(первая сводка: окно 24 ч)", body)
         self.assertIn("окно 2026-10-11T10:47Z … 2026-10-12T10:47Z", body)
 
@@ -116,7 +138,7 @@ class Shape(unittest.TestCase):
         self.assertTrue(body.endswith("СВОДКА НЕПОЛНАЯ: РЕВЬЮЕР, КАНАРЕЙКА, СРОК ХРАНЕНИЯ, МОДЕЛИ\n"))
         self.assertIn(" reviewer=not_observed findings=not_observed canary=not_observed retention=not_observed "
                       "expires_in=not_observed ", dline)
-        self.assertTrue(dline.endswith(" complete=no:reviewer,canary,retention,models"))
+        self.assertIn(" complete=no:reviewer,canary,retention,models merges=", dline)
 
     def test_runs_unreadable(self):
         body, dline, incomplete = dl.build(obs(runs=dl.Missing("нет права actions:read (HTTP 403)")), 1)
@@ -124,20 +146,21 @@ class Shape(unittest.TestCase):
         self.assertEqual(line(body, "НОЧЬ"), "НОЧЬ: не наблюдалось: нет права actions:read (HTTP 403)")
         self.assertIn("НОЧЬ", incomplete)
 
-    def test_every_line_missing_still_ten_lines(self):
+    def test_every_line_missing_still_all_lines(self):
         m = dl.Missing("нет")
         o = obs(runs=m, oldest_reviewer_created=m, open_prs=m, worklog_last=m, standards_last=m,
                 bypass={r: {"day": m, "all": m, "allowed": m} for r in dl.BYPASS_REPOS})
         body, dline, incomplete = dl.build(o, 1)
         self.assertShape(body, dline)
         o["checks"] = {r: m for r in dl.CHECKS_REPOS}
+        o["merges"] = {r: merges_src(commits=m) for r in dl.MERGES_REPOS}
         body, dline, incomplete = dl.build(o, 1)
         self.assertShape(body, dline)
+        five = "probe, factory-ci, factory-knowledge, online-base, cost-panel"
         self.assertEqual(incomplete, [
             "НОЧЬ", "РЕВЬЮЕР", "КАНАРЕЙКА", "СРОК ХРАНЕНИЯ", "ОБХОДЫ (probe, factory-knowledge, online-base)",
-            "ЗАЯВКИ БЕЗ ВЕТКИ", "ЖУРНАЛ", "МОДЕЛИ", "ПРАВИЛА",
-            "ИЗМЕНЕНИЕ ПРОВЕРОК (probe, factory-ci, factory-knowledge, online-base, cost-panel)"])
-        self.assertTrue(all("не наблюдалось" in h for h in lines_of(body)[:10]))
+            f"ВЛИВАНИЯ ({five})", "ЗАЯВКИ БЕЗ ВЕТКИ", "ЖУРНАЛ", "МОДЕЛИ", "ПРАВИЛА", f"ИЗМЕНЕНИЕ ПРОВЕРОК ({five})"])
+        self.assertTrue(all("не наблюдалось" in h for h in lines_of(body)[:len(TITLES)]))
         self.assertIn("complete=no:night,reviewer,canary,retention,bypass(probe+factory-knowledge+online-base),", dline)
 
     def test_code_error_is_printed_not_skipped(self):
@@ -209,6 +232,77 @@ class Nightly(unittest.TestCase):
         body, dline, _ = dl.build(obs(reviewer_logs={REVIEWER_RUN: reviewer_log(models=("PASS", "FAIL", "PASS"))}), 1)
         self.assertIn("models=в=PASS,г=FAIL,д=PASS", dline)
         self.assertIn("(г) FAIL", line(body, "МОДЕЛИ"))
+
+
+class Merges(unittest.TestCase):
+    """D-137: вливания в main — владельцем, не владельцем, без заявки, не прочиталось."""
+
+    def build(self, src, repo=dl.PROBE_REPO):
+        m = {r: merges_src() for r in dl.MERGES_REPOS}
+        m[repo] = src
+        return dl.build(obs(merges=m), 1)
+
+    def test_owner_login_pinned(self):
+        # Смена владельца — изменение конфигурации: этот тест и строка в сводке.
+        self.assertEqual(dl.OWNER_LOGIN, "MartynPin")
+        body, _, _ = self.build(merges_src())
+        self.assertIn("ВЛИВАНИЯ: всего/не владельцем/без заявки, владелец MartynPin — ", body)
+
+    def test_merged_by_owner(self):
+        body, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: [merged_pr(42, SHA1)]}))
+        self.assertIn("merges=probe:1/0/0,", dline)
+        self.assertNotIn("КРАСНЫЙ", line(body, "ВЛИВАНИЯ"))
+        self.assertEqual(incomplete, [])
+
+    def test_merged_by_not_owner_is_red(self):
+        body, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: [merged_pr(42, SHA1)]}, {42: WORKER}))
+        self.assertIn("merges=probe:1/1/0,", dline)
+        self.assertIn(f"probe: 1/1/0 КРАСНЫЙ: 1111111 влил {WORKER}", line(body, "ВЛИВАНИЯ"))
+        self.assertEqual(incomplete, [])  # наблюдено и красное — не пробел
+
+    def test_commit_without_pr_is_red(self):
+        body, dline, _ = self.build(merges_src([{"sha": SHA1}, {"sha": SHA2}],
+                                               {SHA1: [], SHA2: [{"number": 7, "merged_at": None, "base": {"ref": "main"}}]}))
+        self.assertIn("merges=probe:2/0/2,", dline)
+        self.assertIn("probe: 2/0/2 КРАСНЫЙ: 1111111 без заявки, 2222222 без заявки", line(body, "ВЛИВАНИЯ"))
+
+    def test_pr_merged_elsewhere_is_no_pr(self):
+        # Заявка влита не в main — коммит в main попал не ею.
+        _, dline, _ = self.build(merges_src([{"sha": SHA1}], {SHA1: [merged_pr(9, SHA1, base="canary-base")]}))
+        self.assertIn("merges=probe:1/0/1,", dline)
+
+    def test_merged_by_unreadable(self):
+        body, dline, incomplete = self.build(merges_src(
+            [{"sha": SHA1}], {SHA1: [merged_pr(42, SHA1)]},
+            {42: dl.Missing("нет права pull_requests=read (HTTP 403)")}))
+        self.assertIn("merges=probe:not_observed,", dline)
+        self.assertIn("probe: не наблюдалось: заявка #42 коммита 1111111: нет права pull_requests=read (HTTP 403)",
+                      line(body, "ВЛИВАНИЯ"))
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+        self.assertIn(" complete=no:merges(probe) ", dline)
+
+    def test_merged_by_empty(self):
+        _, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: [merged_pr(42, SHA1)]}, {42: ""}))
+        self.assertIn("merges=probe:not_observed,", dline)
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+
+    def test_pulls_unreadable(self):
+        _, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: dl.Missing("HTTP 500")}))
+        self.assertIn("merges=probe:not_observed,", dline)
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+
+    def test_repo_not_visible(self):
+        body, dline, incomplete = self.build(merges_src(dl.Missing("репозиторий не виден токену (HTTP 404)")),
+                                             repo=dl.ONLINE_BASE_REPO)
+        self.assertIn("online-base: не наблюдалось: репозиторий не виден токену (HTTP 404)", line(body, "ВЛИВАНИЯ"))
+        self.assertTrue(dline.endswith(",online-base:not_observed,cost-panel:0/0/0"))
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (online-base)"])
+
+    def test_merge_commit_sha_decides(self):
+        # Коммит связан с двумя влитыми заявками; решает та, чей merge_commit_sha — он.
+        src = merges_src([{"sha": SHA1}], {SHA1: [merged_pr(5, SHA2), merged_pr(6, SHA1)]}, {5: WORKER, 6: dl.OWNER_LOGIN})
+        _, dline, _ = self.build(src)
+        self.assertIn("merges=probe:1/0/0,", dline)
 
 
 class Window(unittest.TestCase):
@@ -319,6 +413,9 @@ class Flow(unittest.TestCase):
         self.runs = []
         self.digests = []
         self.checks_queries = []
+        self.main_commits = {F.REPO: [{"sha": "f" * 40, "commit": {"committer": {"date": "2026-10-12T09:00:00Z"}}}]}
+        self.commit_pulls = {"f" * 40: [merged_pr(42, "f" * 40)]}
+        self.merged_by = "MartynPin"
         self.github_commits = {F.REPO: [{"sha": "f1be53b" + "0" * 33, "commit": {"committer": {"date": "2026-10-12T09:00:00Z"}}}]}
         self.env = {"GH_TOKEN_READ": "r", "GH_TOKEN_KNOWLEDGE": "k", "GH_TOKEN_DIGEST": "d",
                     "GITHUB_RUN_ID": str(OWN_RUN), "GITHUB_RUN_NUMBER": "3"}
@@ -338,6 +435,17 @@ class Flow(unittest.TestCase):
             return ok({"workflow_runs": self.digests})
         if p == f"/repos/{F.REPO}/actions/runs":
             return ok({"workflow_runs": self.runs if "page=1" in path else []})
+        if p.endswith("/commits") and "path=" not in path:  # вливания в main за окно
+            repo = p[len("/repos/"):-len("/commits")]
+            if repo in ("Online-Base1/online-base", "Online-Base1/cost-panel") or (repo == F.KR and token != "Bearer k"):
+                return 404, {}, b"{}"
+            return ok(self.main_commits.get(repo, []) if "page=1" in path else [])
+        m_pulls = re.fullmatch(r"/repos/([^/]+/[^/]+)/commits/([0-9a-f]{40})/pulls", p)
+        if m_pulls:
+            return ok(self.commit_pulls.get(m_pulls.group(2), []))
+        m_pull = re.fullmatch(rf"/repos/{F.REPO}/pulls/(\d+)", p)
+        if m_pull:
+            return ok({"number": int(m_pull.group(1)), "merged_by": {"login": self.merged_by}})
         if p.endswith("/commits") and "path=.github" in path:
             repo = p[len("/repos/"):-len("/commits")]
             if repo in ("Online-Base1/online-base", "Online-Base1/cost-panel"):
@@ -380,6 +488,15 @@ class Flow(unittest.TestCase):
         self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 1 (f1be53b); factory-ci: 0; "
                       "factory-knowledge: 0; online-base: не наблюдалось: нет права contents:read на online-base", posted)
         self.assertIn("(первая сводка: окно 24 ч)", posted)
+        self.assertIn("владелец MartynPin — probe: 1/0/0; factory-ci: 0/0/0; factory-knowledge: 0/0/0; "
+                      "online-base: не наблюдалось: репозиторий не виден токену (HTTP 404); "
+                      "cost-panel: не наблюдалось: репозиторий не виден токену (HTTP 404)", posted)
+
+    def test_merge_by_not_owner_flow(self):
+        self.merged_by = WORKER
+        body, code = dg.run(self.env, self.transport, now=NOW)
+        self.assertEqual(code, 0)  # сводка отчитывается о наблюдении и выходит зелёной
+        self.assertIn(f"probe: 1/1/0 КРАСНЫЙ: fffffff влил {WORKER}", body)
 
     def test_knowledge_token_missing_still_published(self):
         del self.env["GH_TOKEN_KNOWLEDGE"]

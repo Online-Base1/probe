@@ -12,6 +12,8 @@
 Ночь — последний canary-trigger по расписанию; ручные прогоны в ночь не входят
 (D-133 c). Окно — от предыдущей сводки до текущей, первая берёт 24 ч (D-133 d).
 Десятая строка — изменения .github/** за окно по репозиториям (D-134).
+Строка ВЛИВАНИЯ — вливания в main не владельцем и без заявки (D-137): замена
+пробы BB-37 без администраторского права; ОБХОДЫ — другая величина и остаётся.
 
 Всё, что приходит из сети, передаётся сюда уже полученным (digest.py); то,
 что получить не удалось, приходит как Missing(причина). Так каждая строка
@@ -41,7 +43,13 @@ BYPASS_REPOS = (PROBE_REPO, rl.KNOWLEDGE_REPO, ONLINE_BASE_REPO)
 # и откуда они берутся (factory-ci). Недоступный токену — «не наблюдалось».
 CHECKS_PATH = ".github"
 CHECKS_REPOS = (PROBE_REPO, FACTORY_CI_REPO, rl.KNOWLEDGE_REPO, ONLINE_BASE_REPO, COST_PANEL_REPO)
-PER_REPO_LINES = {"bypass", "checks"}
+# Вливания в main за окно (D-137): кто влил — по merged_by заявки, а не по
+# rule-suites. Владелец — названная константа, а не «кто чаще встречается»;
+# её смена — изменение конфигурации: тест test_owner_login_pinned и сама
+# строка ВЛИВАНИЯ, которая печатает владельца каждую ночь.
+OWNER_LOGIN = "MartynPin"
+MERGES_REPOS = CHECKS_REPOS
+PER_REPO_LINES = {"bypass", "merges", "checks"}
 
 FIRST_WINDOW_HOURS = 24
 NOT_OBSERVED = "not_observed"
@@ -54,6 +62,7 @@ LINES = (
     ("canary", "КАНАРЕЙКА"),
     ("retention", "СРОК ХРАНЕНИЯ"),
     ("bypass", "ОБХОДЫ"),
+    ("merges", "ВЛИВАНИЯ"),
     ("prless", "ЗАЯВКИ БЕЗ ВЕТКИ"),
     ("worklog", "ЖУРНАЛ"),
     ("models", "МОДЕЛИ"),
@@ -71,10 +80,11 @@ FIELDS_OF = {
     "models": ("models",),
     "standards": ("standards_age",),
     "checks": ("checks_changed",),
+    "merges": ("merges",),
 }
 DIGEST_FIELDS = ("seq", "date", "runs", "red", "unknown", "reviewer", "findings", "canary", "retention",
                  "expires_in", "bypass_24h", "bypass_30d", "prless_branch", "worklog_age", "models",
-                 "standards_age", "checks_changed", "complete")
+                 "standards_age", "checks_changed", "complete", "merges")
 
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required", "cancelled", "stale"}
 MODEL_CHECKS = ("в", "г", "д")
@@ -304,6 +314,59 @@ def line_bypass(obs):
     return "; ".join(parts), {"bypass_24h": ",".join(day_f), "bypass_30d": ",".join(all_f)}, gaps
 
 
+def merge_verdict(sha, pulls, pull_detail):
+    """Как коммит попал в main (D-137 §b) → ("owner"|"not_owner"|"no_pr", кто).
+
+    pulls — заявки, связанные с коммитом (commits/{sha}/pulls); pull_detail(n) —
+    заявка целиком (merged_by есть только в ней) или Missing. Заявка, которой
+    коммит влит, — та, чей merge_commit_sha равен коммиту; иначе влитая в main.
+    Ни одной влитой — «без заявки»: прямой push в main закрыт защитой, его
+    появление само по себе событие. merged_by не прочитался — NotObserved.
+    """
+    merged = [p for p in pulls if p.get("merged_at") and (p.get("base") or {}).get("ref") == "main"]
+    if not merged:
+        return "no_pr", None
+    own = [p for p in merged if p.get("merge_commit_sha") == sha] or merged
+    detail = pull_detail(own[0]["number"])
+    if isinstance(detail, Missing):
+        raise NotObserved(f"заявка #{own[0]['number']} коммита {sha[:7]}: {detail.reason}")
+    login = (detail.get("merged_by") or {}).get("login")
+    if not login:
+        raise NotObserved(f"у заявки #{own[0]['number']} коммита {sha[:7]} merged_by пуст")
+    return ("owner" if login == OWNER_LOGIN else "not_owner"), login
+
+
+def line_merges(obs):
+    """<репозиторий>:<всего>/<не владельцем>/<без заявки> (D-137 §c). Не владельцем
+    или без заявки — КРАСНЫЙ с перечнем коммитов; merged_by не прочитался —
+    репозиторий «не наблюдалось» и пробел сводки. Факт обнаруживается ПОСЛЕ
+    вливания: это наблюдение, не доказательство невозможности (D-137 §e)."""
+    parts, fields, gaps = [], [], []
+    for repo in MERGES_REPOS:
+        m, name = obs["merges"][repo], short(repo)
+        try:
+            commits = need(m["commits"])
+            verdicts = []
+            for c in commits:
+                pulls = need(m["pulls"].get(c["sha"], Missing(f"заявки коммита {c['sha'][:7]} не запрошены")))
+                verdicts.append((c["sha"], *merge_verdict(c["sha"], pulls, m["pull_detail"])))
+        except NotObserved as exc:
+            parts.append(f"{name}: не наблюдалось: {exc.reason}")
+            fields.append(f"{name}:{NOT_OBSERVED}")
+            gaps.append(name)
+            continue
+        not_owner = [(s, who) for s, v, who in verdicts if v == "not_owner"]
+        no_pr = [s for s, v, _ in verdicts if v == "no_pr"]
+        text = f"{name}: {len(verdicts)}/{len(not_owner)}/{len(no_pr)}"
+        red = [f"{s[:7]} без заявки" for s in no_pr] + [f"{s[:7]} влил {who}" for s, who in not_owner]
+        if red:
+            text += " КРАСНЫЙ: " + ", ".join(red)
+        parts.append(text)
+        fields.append(f"{name}:{len(verdicts)}/{len(not_owner)}/{len(no_pr)}")
+    return (f"всего/не владельцем/без заявки, владелец {OWNER_LOGIN} — " + "; ".join(parts),
+            {"merges": ",".join(fields)}, gaps)
+
+
 def line_prless(obs):
     prs = need(obs["open_prs"])
     without, unread = [], []
@@ -372,7 +435,7 @@ def line_checks(obs):
 
 LINE_FUNCS = {"night": line_night, "reviewer": line_reviewer, "canary": line_canary, "retention": line_retention,
               "bypass": line_bypass, "prless": line_prless, "worklog": line_worklog, "models": line_models,
-              "standards": line_standards, "checks": line_checks}
+              "standards": line_standards, "checks": line_checks, "merges": line_merges}
 
 
 def compute_line(key, obs):
