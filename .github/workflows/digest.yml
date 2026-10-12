@@ -1,0 +1,78 @@
+# Ночная сводка (D-121, BB-38): один комментарий за ночь в закреплённую
+# factory-knowledge#DIGEST_ISSUE (digest_lib.py).
+#
+# Свой workflow по расписанию, через 30 минут после canary-trigger (17 3 * * *).
+# НЕ job внутри ночного прогона и НЕ workflow_run от него (D-121 §c):
+# поверхность, встроенная в наблюдаемое, умирает вместе с ним, а сводка
+# обязана выйти и тогда, когда ночной прогон не запустился вовсе.
+#
+# Девять строк фиксированного порядка, DIGEST, последняя строка СВОДКА ПОЛНАЯ /
+# СВОДКА НЕПОЛНАЯ. Невычисленная строка — «не наблюдалось: <причина>»;
+# сломанный ревьюер сводку не краснит. Красный прогон — только когда
+# комментарий не опубликован.
+#
+# Токены приложения ревьюера (D-104): публикация — только issues:write на
+# factory-knowledge; строка ПРАВИЛА — отдельный contents:read на
+# factory-knowledge (тот же, что в reviewer.yml). Права установки не
+# расширяются; чего не хватает — печатается «нет права <какое>».
+# Ни один процесс не запускается по issue или комментарию (условие D-104,
+# test_no_issue_triggers).
+name: digest
+
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Checkout digest code (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/reviewer/
+          sparse-checkout-cone-mode: false
+
+      # Не выпускается подмножеством — прогон останавливается здесь, сводки нет.
+      - name: Mint reviewer token (factory-knowledge, issues:write)
+        id: issues
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: factory-knowledge
+          permission-issues: write
+
+      # Без этого токена сводка всё равно выходит: строка ПРАВИЛА — «не наблюдалось».
+      - name: Mint reviewer token (factory-knowledge, contents:read)
+        id: fk
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: factory-knowledge
+          permission-contents: read
+
+      - name: Digest
+        shell: bash
+        env:
+          GH_TOKEN_READ: ${{ github.token }}
+          GH_TOKEN_KNOWLEDGE: ${{ steps.fk.outputs.token }}
+          GH_TOKEN_DIGEST: ${{ steps.issues.outputs.token }}
+        run: python3 .github/reviewer/digest.py
