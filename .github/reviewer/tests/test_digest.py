@@ -85,7 +85,7 @@ def obs(**over):
         "branch_exists": {},
         "worklog_last": "2026-10-11T08:00:00Z",
         "standards_last": "2026-10-10T08:00:00Z",
-        "checks": {r: [] for r in dl.CHECKS_REPOS},
+        "checks": {r: {} for r in dl.CHECKS_REPOS},
         "merges": {r: merges_src() for r in dl.MERGES_REPOS},
     }
     o.update(over)
@@ -162,7 +162,6 @@ class Shape(unittest.TestCase):
                 bypass={r: {"day": m, "all": m, "allowed": m} for r in dl.BYPASS_REPOS})
         body, dline, incomplete = dl.build(o, 1)
         self.assertShape(body, dline)
-        o["checks"] = {r: m for r in dl.CHECKS_REPOS}
         o["merges"] = {r: merges_src(commits=m) for r in dl.MERGES_REPOS}
         body, dline, incomplete = dl.build(o, 1)
         self.assertShape(body, dline)
@@ -250,7 +249,9 @@ class Merges(unittest.TestCase):
     def build(self, src, repo=dl.PROBE_REPO):
         m = {r: merges_src() for r in dl.MERGES_REPOS}
         m[repo] = src
-        return dl.build(obs(merges=m), 1)
+        cmp = src.get("compare") if isinstance(src.get("compare"), dict) else {}
+        files = {c["sha"]: ["lib/x.ts"] for c in cmp.get("commits") or []}  # .github не трогают
+        return dl.build(obs(merges=m, checks={**{r: {} for r in dl.CHECKS_REPOS}, repo: files}), 1)
 
     def test_owner_login_pinned(self):
         # Смена владельца — изменение конфигурации: этот тест и строка в сводке.
@@ -323,18 +324,21 @@ class Merges(unittest.TestCase):
         body, dline, incomplete = self.build(merges_src(base=dl.Missing("журнал сводки 7: HTTP 410")))
         self.assertIn("probe: не наблюдалось: предыдущая вершина не прочитана: журнал сводки 7: HTTP 410",
                       line(body, "ВЛИВАНИЯ"))
-        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+        # диапазон не определён — пробел обеих строк, что на нём стоят
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)", "ИЗМЕНЕНИЕ ПРОВЕРОК (probe)"])
 
     def test_rewritten_main_is_red_and_gap(self):
         body, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: [merged_pr(1, SHA1)]}, status="diverged"))
         self.assertIn("probe: не наблюдалось: КРАСНЫЙ: история main не продолжает запомненную вершину bbbbbbb "
                       "(compare bbbbbbb...ccccccc: diverged)", line(body, "ВЛИВАНИЯ"))
-        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+        # диапазон не определён — пробел обеих строк, что на нём стоят
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)", "ИЗМЕНЕНИЕ ПРОВЕРОК (probe)"])
 
     def test_range_truncated_not_observed(self):
         _, dline, incomplete = self.build(merges_src([{"sha": SHA1}], {SHA1: [merged_pr(1, SHA1)]}, total=300))
         self.assertIn("merges=probe:not_observed,", dline)
-        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)"])
+        # диапазон не определён — пробел обеих строк, что на нём стоят
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (probe)", "ИЗМЕНЕНИЕ ПРОВЕРОК (probe)"])
 
     def test_heads_remembered_in_body(self):
         m = {r: merges_src() for r in dl.MERGES_REPOS}
@@ -350,13 +354,38 @@ class Merges(unittest.TestCase):
                                              repo=dl.ONLINE_BASE_REPO)
         self.assertIn("online-base: не наблюдалось: репозиторий не виден токену (HTTP 404)", line(body, "ВЛИВАНИЯ"))
         self.assertTrue(dline.endswith(",online-base:not_observed,cost-panel:0/0/0"))
-        self.assertEqual(incomplete, ["ВЛИВАНИЯ (online-base)"])
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (online-base)", "ИЗМЕНЕНИЕ ПРОВЕРОК (online-base)"])
 
     def test_merge_commit_sha_decides(self):
         # Коммит связан с двумя влитыми заявками; решает та, чей merge_commit_sha — он.
         src = merges_src([{"sha": SHA1}], {SHA1: [merged_pr(5, SHA2), merged_pr(6, SHA1)]}, {5: WORKER, 6: dl.OWNER_LOGIN})
         _, dline, _ = self.build(src)
         self.assertIn("merges=probe:1/0/0,", dline)
+
+
+class CommitFiles(unittest.TestCase):
+    """digest.commit_files: файлы коммитов диапазона; усечённый список — Missing."""
+
+    class GH:
+        def __init__(self, n):
+            self.n = n
+
+        def request(self, method, path, body=None, accept=None):
+            return 200, {}, json.dumps({"files": [{"filename": f"f{i}"} for i in range(self.n)]}).encode()
+
+    def merges(self):
+        return {"compare": {"status": "ahead", "commits": [{"sha": SHA1}]}}
+
+    def test_files_listed(self):
+        self.assertEqual(dg.commit_files(self.GH(2), dl.PROBE_REPO, self.merges()), {SHA1: ["f0", "f1"]})
+
+    def test_truncated_is_missing(self):
+        out = dg.commit_files(self.GH(dg.COMMIT_FILES_LIMIT), dl.PROBE_REPO, self.merges())
+        self.assertIsInstance(out[SHA1], dl.Missing)
+        self.assertIn("список усечён", out[SHA1].reason)
+
+    def test_no_range_no_requests(self):
+        self.assertEqual(dg.commit_files(None, dl.PROBE_REPO, {"compare": None}), {})
 
 
 class Window(unittest.TestCase):
@@ -443,14 +472,48 @@ class Lines(unittest.TestCase):
         self.assertIn("worklog_age=10 ", dline)
         self.assertIn("standards_age=not_observed ", dline)
 
-    def test_checks_changed_per_repo(self):
-        c = {r: [] for r in dl.CHECKS_REPOS}
-        c[dl.PROBE_REPO] = [{"sha": "f1be53b" + "0" * 33, "date": "x"}, {"sha": "d4ee0ef" + "0" * 33, "date": "y"}]
-        c[dl.ONLINE_BASE_REPO] = dl.Missing("нет права contents:read на online-base: ресурс не виден токену (HTTP 404)")
-        body, dline, incomplete = dl.build(obs(checks=c), 1)
+    # ИЗМЕНЕНИЕ ПРОВЕРОК — тот же диапазон от запомненной вершины, что у ВЛИВАНИЙ (D-138 b).
+
+    def checks_build(self, merges_probe, files_probe, extra=None):
+        m = {r: merges_src() for r in dl.MERGES_REPOS}
+        m[dl.PROBE_REPO] = merges_probe
+        m.update(extra or {})
+        return dl.build(obs(merges=m, checks={**{r: {} for r in dl.CHECKS_REPOS}, dl.PROBE_REPO: files_probe}), 1)
+
+    def test_checks_changed_in_range(self):
+        a, b, c = "f1be53b" + "0" * 33, "d4ee0ef" + "0" * 33, "a" * 40
+        src = merges_src([{"sha": a}, {"sha": b}, {"sha": c}], {x: [merged_pr(1, x)] for x in (a, b, c)})
+        files = {a: [".github/workflows/ci.yml"], b: [".github/reviewer/x.py", "lib/y.ts"], c: ["lib/z.ts", "github.md", ".githubish/a"]}
+        body, dline, incomplete = self.checks_build(src, files, {
+            dl.ONLINE_BASE_REPO: merges_src(dl.Missing("репозиторий не виден токену (HTTP 404)"))})
         self.assertIn("checks_changed=probe:2,factory-ci:0,factory-knowledge:0,online-base:not_observed,cost-panel:0 ", dline)
-        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 2 (f1be53b, d4ee0ef); factory-ci: 0;", body)
-        self.assertEqual(incomplete, ["ИЗМЕНЕНИЕ ПРОВЕРОК (online-base)"])
+        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 2 (f1be53b, d4ee0ef); "
+                      "factory-ci: 0 (запросов не было);", body)
+        self.assertEqual(incomplete, ["ВЛИВАНИЯ (online-base)", "ИЗМЕНЕНИЕ ПРОВЕРОК (online-base)"])
+
+    def test_checks_range_commits_without_github_is_observed_zero(self):
+        src = merges_src([{"sha": SHA1}], {SHA1: [merged_pr(1, SHA1)]})
+        body, dline, _ = self.checks_build(src, {SHA1: ["lib/a.ts"]})
+        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 0; factory-ci", body)
+
+    def test_checks_first_with_remembered_tip(self):
+        body, _, incomplete = self.checks_build(merges_src(base=None), {})
+        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 0 (запросов не было: начало диапазона — "
+                      "текущая вершина ccccccc, первая сводка с запомненной вершиной)", body)
+        self.assertEqual(incomplete, [])
+
+    def test_checks_commit_files_unreadable(self):
+        src = merges_src([{"sha": SHA1}], {SHA1: [merged_pr(1, SHA1)]})
+        body, dline, incomplete = self.checks_build(src, {SHA1: dl.Missing("HTTP 502")})
+        self.assertIn("probe: не наблюдалось: файлы коммита 1111111: HTTP 502", line(body, "ИЗМЕНЕНИЕ ПРОВЕРОК"))
+        self.assertIn("checks_changed=probe:not_observed,", dline)
+        self.assertEqual(incomplete, ["ИЗМЕНЕНИЕ ПРОВЕРОК (probe)"])
+
+    def test_checks_rewritten_main(self):
+        src = merges_src([{"sha": SHA1}], {SHA1: [merged_pr(1, SHA1)]}, status="diverged")
+        body, _, incomplete = self.checks_build(src, {SHA1: [".github/x"]})
+        self.assertIn("probe: не наблюдалось: КРАСНЫЙ: история main не продолжает", line(body, "ИЗМЕНЕНИЕ ПРОВЕРОК"))
+        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК (probe)", incomplete)
 
     def test_values_have_no_spaces(self):
         log = reviewer_log(result="UNKNOWN(review_job_failure)")
@@ -466,7 +529,8 @@ class Flow(unittest.TestCase):
         self.post_status = 201
         self.runs = []
         self.digests = []
-        self.checks_queries = []
+        self.files_queries = []
+        self.commit_files = {"f" * 40: [".github/workflows/digest.yml"]}
         self.main_commits = {F.REPO: [{"sha": "f" * 40}]}
         self.tips = {F.REPO: "f" * 40}
         self.compares = []
@@ -516,15 +580,10 @@ class Flow(unittest.TestCase):
         m_pull = re.fullmatch(rf"/repos/{F.REPO}/pulls/(\d+)", p)
         if m_pull:
             return ok({"number": int(m_pull.group(1)), "merged_by": {"login": self.merged_by}})
-        if p.endswith("/commits") and "path=.github" in path:
-            repo = p[len("/repos/"):-len("/commits")]
-            if repo in ("Online-Base1/online-base", "Online-Base1/cost-panel"):
-                return 404, {}, b"{}"
-            if repo == F.KR and token != "Bearer k":
-                return 404, {}, b"{}"
-            self.checks_queries.append(path)
-            commits = self.github_commits.get(repo, [])
-            return ok(commits if "page=1" in path else [])
+        m_commit = re.fullmatch(r"/repos/([^/]+/[^/]+)/commits/([0-9a-f]{40})", p)
+        if m_commit:
+            self.files_queries.append(m_commit.groups())
+            return ok({"sha": m_commit.group(2), "files": [{"filename": f} for f in self.commit_files.get(m_commit.group(2), [])]})
         if p == f"/repos/{F.REPO}/actions/workflows/reviewer.yml/runs":
             return ok({"total_count": 0, "workflow_runs": []})
         if p == f"/repos/{F.REPO}/pulls":
@@ -555,8 +614,12 @@ class Flow(unittest.TestCase):
         self.assertEqual([c for c in self.calls if c[2] == "Bearer d" and c[0] == "GET"], [])
         self.assertFalse([c for c in self.calls if c[0] == "GET" and c[2] == ""])
         self.assertNotIn("HTTP 599", posted)  # каждый запрос сводки знаком подделке
-        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 1 (f1be53b); factory-ci: 0; "
-                      "factory-knowledge: 0; online-base: не наблюдалось: нет права contents:read на online-base", posted)
+        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 0 (запросов не было: начало диапазона — "
+                      "текущая вершина fffffff, первая сводка с запомненной вершиной); factory-ci: 0 (запросов не было: "
+                      "начало диапазона — текущая вершина ccccccc, первая сводка с запомненной вершиной); factory-knowledge: 0 "
+                      "(запросов не было: начало диапазона — текущая вершина ccccccc, первая сводка с запомненной вершиной); "
+                      "online-base: не наблюдалось: репозиторий не виден токену (HTTP 404)", posted)
+        self.assertEqual(self.files_queries, [])
         self.assertIn("(первая сводка: окно 24 ч)", posted)
         first = "(запросов не было: начало диапазона — текущая вершина {}, первая сводка с запомненной вершиной)"
         self.assertIn(f"владелец MartynPin — probe: 0/0/0 {first.format('fffffff')}; "
@@ -577,6 +640,8 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.compares, [(F.REPO, "e" * 40, "f" * 40)])  # factory-ci не сдвинулся — без запроса
         self.assertIn("probe: 1/0/0; factory-ci: 0/0/0 (запросов не было); factory-knowledge: 0/0/0 (запросов не было: "
                       "начало диапазона — текущая вершина ccccccc, первая сводка с запомненной вершиной)", body)
+        self.assertEqual(self.files_queries, [(F.REPO, "f" * 40)])
+        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 1 (fffffff); factory-ci: 0 (запросов не было)", body)
 
     def test_merge_by_not_owner_flow(self):
         self.merged_by = WORKER
@@ -608,8 +673,7 @@ class Flow(unittest.TestCase):
         self.assertIn("НОЧЬ: прогонов 0, красных 0", body)
         q = [c[1] for c in self.calls if "/actions/runs?" in c[1]][0]
         self.assertIn("created=%3E%3D2026-10-11T10%3A47%3A00Z", q)
-        self.assertTrue(all("since=2026-10-11T10%3A47%3A00Z&until=2026-10-12T10%3A47%3A00Z" in x
-                            for x in self.checks_queries))
+        self.assertFalse([c for c in self.calls if "since=" in c[1] or "path=.github" in c[1]])  # по дате — больше нет
 
     def test_window_from_previous_digest(self):
         self.digests = [{"id": OWN_RUN, "created_at": "2026-10-12T10:47:00Z"},
