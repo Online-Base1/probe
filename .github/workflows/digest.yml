@@ -15,8 +15,8 @@
 # комментарий не опубликован.
 #
 # Токены приложения ревьюера (D-104): публикация — только issues:write на
-# factory-knowledge; строка ПРАВИЛА — отдельный contents:read на
-# factory-knowledge (тот же, что в reviewer.yml). Права установки не
+# factory-knowledge; чтение — отдельный токен contents:read и pull-requests:read
+# на factory-knowledge (строки ПРАВИЛА и ВЛИВАНИЯ). Права установки не
 # расширяются; чего не хватает — печатается «нет права <какое>».
 # Ни один процесс не запускается по issue или комментарию (условие D-104,
 # test_no_issue_triggers).
@@ -60,8 +60,12 @@ jobs:
           repositories: factory-knowledge
           permission-issues: write
 
-      # Без этого токена сводка всё равно выходит: строка ПРАВИЛА — «не наблюдалось».
-      - name: Mint reviewer token (factory-knowledge, contents:read)
+      # Чтение factory-knowledge: строка ПРАВИЛА (contents) и заявки коммитов в
+      # строке ВЛИВАНИЯ (pull-requests: площадка на commits/{sha}/pulls ответила
+      # 403 pull_requests=read, прогон 38291821501). Право у установки уже есть
+      # (D-104), токен его теперь просит. Без этого токена сводка всё равно
+      # выходит: ПРАВИЛА и ВЛИВАНИЯ factory-knowledge — «не наблюдалось».
+      - name: Mint reviewer token (factory-knowledge, contents:read, pull-requests:read)
         id: fk
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -71,6 +75,7 @@ jobs:
           owner: ${{ github.repository_owner }}
           repositories: factory-knowledge
           permission-contents: read
+          permission-pull-requests: read
 
       - name: Digest
         shell: bash

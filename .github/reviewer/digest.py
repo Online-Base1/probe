@@ -7,7 +7,7 @@ Missing(причина) и даёт строку «не наблюдалось»
 
 Токены (окружение, не печатаются):
   GH_TOKEN_READ      — github.token прогона: actions/contents/pull-requests:read на probe;
-  GH_TOKEN_KNOWLEDGE — приложение ревьюера, factory-knowledge, contents:read (строка ПРАВИЛА);
+  GH_TOKEN_KNOWLEDGE — приложение ревьюера, factory-knowledge, contents:read + pull-requests:read (ПРАВИЛА, ВЛИВАНИЯ);
   GH_TOKEN_DIGEST    — приложение ревьюера, factory-knowledge, issues:write (только публикация).
 Права ни одного из них не расширяются: чего не хватает, то печатается как
 «не наблюдалось: нет права <какое>» — право называет сама площадка
@@ -36,11 +36,11 @@ def _header(headers, name):
     return None
 
 
-def why(status, headers, right):
-    """Причина отказа словами. Право — из ответа площадки, если она его назвала."""
+def why(status, headers, right, message=""):
+    """Причина отказа словами. Право и текст — из ответа площадки, как есть."""
     accepted = _header(headers, "X-Accepted-GitHub-Permissions")
     if status == 403:
-        return f"нет права {accepted or right} (HTTP 403)"
+        return f"нет права {accepted or right} (HTTP 403" + (f": {message})" if message else ")")
     if status == 404:
         return f"нет права {right}: ресурс не виден токену (HTTP 404)"
     return f"HTTP {status} ({right})"
@@ -55,7 +55,11 @@ def get(gh, path, right):
     except Exception as exc:  # сеть: причина без подробностей запроса
         return dl.Missing(f"ошибка запроса {type(exc).__name__} ({right})")
     if status != 200:
-        return dl.Missing(why(status, headers, right))
+        try:
+            message = str(json.loads(data).get("message") or "")[:200]
+        except (ValueError, AttributeError):
+            message = ""
+        return dl.Missing(why(status, headers, right, message))
     return json.loads(data)
 
 
@@ -90,12 +94,11 @@ def previous_digest(gh, repo, run_id, created):
     return None
 
 
-def checks_commits(gh, repo, start, end, path=dl.CHECKS_PATH):
-    """Коммиты на main за окно (по умолчанию — затронувшие .github/)."""
+def checks_commits(gh, repo, start, end):
+    """Коммиты на main, затронувшие .github/, за окно."""
     q = urllib.parse.quote
     fmt = "%Y-%m-%dT%H:%M:%SZ"
-    only = f"path={path}&" if path else ""
-    commits = get_pages(gh, f"/repos/{repo}/commits?{only}sha=main"
+    commits = get_pages(gh, f"/repos/{repo}/commits?path={dl.CHECKS_PATH}&sha=main"
                             f"&since={q(start.strftime(fmt))}&until={q(end.strftime(fmt))}",
                         f"contents:read на {dl.short(repo)}")
     if isinstance(commits, dl.Missing):
@@ -103,24 +106,41 @@ def checks_commits(gh, repo, start, end, path=dl.CHECKS_PATH):
     return [{"sha": c["sha"], "date": c["commit"]["committer"]["date"]} for c in commits]
 
 
-def merges_of(gh, repo, start, end):
-    """Вливания в main за окно (D-137 §b): коммиты, их заявки и merged_by.
+def previous_heads(gh, repo, previous):
+    """Вершины main, запомненные прошлой сводкой (строка DIGEST_HEADS в её журнале).
 
-    Окно — по дате коммиттера: у squash-вливания это время вливания. Прямой
-    push старого коммита с ранней датой в окно не попадёт — предел способа.
+    None — прошлой сводки нет или она вершин не запоминала (первая после
+    введения, D-138 b); Missing — журнал не прочитан.
     """
-    commits = checks_commits(gh, repo, start, end, path="")
-    if isinstance(commits, dl.Missing):
-        if "HTTP 404" in commits.reason:
-            commits = dl.Missing("репозиторий не виден токену (HTTP 404)")
-        return {"commits": commits, "pulls": {}, "pull_detail": None}
-    pulls = {c["sha"]: get(gh, f"/repos/{repo}/commits/{c['sha']}/pulls", f"pull-requests:read на {dl.short(repo)}")
-             for c in commits}
+    if previous is None or isinstance(previous, dl.Missing):
+        return previous
+    status, text = rv.run_log_text(gh, repo, previous["id"])
+    if status != 200:
+        return dl.Missing(f"журнал сводки {previous['id']}: HTTP {status}")
+    return dl.heads_of(text)
 
-    def pull_detail(number):
-        return get(gh, f"/repos/{repo}/pulls/{number}", f"pull-requests:read на {dl.short(repo)}")
 
-    return {"commits": commits, "pulls": pulls, "pull_detail": pull_detail}
+def merges_of(gh, repo, heads):
+    """Вливания в main с прошлой сводки (D-137 §b, D-138 b): вершина, начало
+    диапазона, сравнение, заявки коммитов и merged_by."""
+    right = f"contents:read на {dl.short(repo)}"
+    ref = get(gh, f"/repos/{repo}/git/ref/heads/main", right)
+    if isinstance(ref, dl.Missing):
+        tip = dl.Missing("репозиторий не виден токену (HTTP 404)") if "HTTP 404" in ref.reason else ref
+    else:
+        tip = ref["object"]["sha"]
+    base = heads if isinstance(heads, dl.Missing) or heads is None else heads.get(dl.short(repo))
+    out = {"tip": tip, "base": base, "compare": None, "pulls": {}, "pull_detail": None}
+    if not isinstance(tip, str) or not isinstance(base, str) or base == tip:
+        return out
+    cmp = get(gh, f"/repos/{repo}/compare/{base}...{tip}", right)
+    out["compare"] = cmp
+    if isinstance(cmp, dl.Missing) or cmp.get("status") != "ahead":
+        return out
+    right_pr = f"pull-requests:read на {dl.short(repo)}"
+    out["pulls"] = {c["sha"]: get(gh, f"/repos/{repo}/commits/{c['sha']}/pulls", right_pr) for c in cmp.get("commits") or []}
+    out["pull_detail"] = lambda number: get(gh, f"/repos/{repo}/pulls/{number}", right_pr)
+    return out
 
 
 def last_commit_date(gh, repo, path, right):
@@ -166,6 +186,7 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
     created = own_created(gh_read, probe, own_run_id)
     previous = previous_digest(gh_read, probe, own_run_id, created)
     start, end, _ = dl.digest_window(now, created, previous)
+    heads = previous_heads(gh_read, probe, previous)
     since = urllib.parse.quote(">=" + start.strftime("%Y-%m-%dT%H:%M:%SZ"))
     runs = get_pages(gh_read, f"/repos/{probe}/actions/runs?created={since}", "actions:read на probe",
                      key="workflow_runs")
@@ -212,7 +233,7 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
         "standards_last": last_commit_date(gh_knowledge, rl.KNOWLEDGE_REPO, dl.STANDARDS_PATH,
                                            "contents:read на factory-knowledge"),
         "checks": {repo: checks_commits(tokens[repo], repo, start, end) for repo in dl.CHECKS_REPOS},
-        "merges": {repo: merges_of(tokens[repo], repo, start, end) for repo in dl.MERGES_REPOS},
+        "merges": {repo: merges_of(tokens[repo], repo, heads) for repo in dl.MERGES_REPOS},
     }
 
 

@@ -134,13 +134,17 @@ class Workflows(unittest.TestCase):
 
     def test_digest_token_scopes(self):
         t = read("digest.yml")
-        issues = t[t.index("Mint reviewer token (factory-knowledge, issues:write)"):t.index("Mint reviewer token (factory-knowledge, contents:read)")]
+        read_step = "Mint reviewer token (factory-knowledge, contents:read, pull-requests:read)"
+        issues = t[t.index("Mint reviewer token (factory-knowledge, issues:write)"):t.index(read_step)]
         self.assertIn("repositories: factory-knowledge", issues)
         self.assertEqual(re.findall(r"permission-[a-z-]+: \w+", issues), ["permission-issues: write"])
         self.assertNotIn("continue-on-error", issues)
-        fk = t[t.index("Mint reviewer token (factory-knowledge, contents:read)"):t.index("- name: Digest\n")]
+        # Чтение factory-knowledge: строка ПРАВИЛА (contents) и заявки коммитов в
+        # строке ВЛИВАНИЯ (pull-requests, D-139 решение; площадка: pull_requests=read).
+        fk = t[t.index(read_step):t.index("- name: Digest\n")]
         self.assertIn("repositories: factory-knowledge", fk)
-        self.assertEqual(re.findall(r"permission-[a-z-]+: \w+", fk), ["permission-contents: read"])
+        self.assertEqual(sorted(re.findall(r"permission-[a-z-]+: \w+", fk)),
+                         ["permission-contents: read", "permission-pull-requests: read"])
         job = job_block(t, "digest")
         self.assertIn("permissions:\n      actions: read\n      contents: read\n      pull-requests: read\n    steps:", job)
         self.assertEqual(set(re.findall(r"secrets\.[A-Z_]+", t)), {"secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY"})
