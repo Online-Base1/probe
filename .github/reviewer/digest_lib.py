@@ -11,7 +11,8 @@
 не прочитан — N/unknown, и репозиторий называется в СВОДКА НЕПОЛНАЯ (D-133 b).
 Ночь — последний canary-trigger по расписанию; ручные прогоны в ночь не входят
 (D-133 c). Окно — от предыдущей сводки до текущей, первая берёт 24 ч (D-133 d).
-Десятая строка — изменения .github/** за окно по репозиториям (D-134).
+Строка ИЗМЕНЕНИЕ ПРОВЕРОК — коммиты в .github/** по репозиториям (D-134) в
+том же диапазоне от запомненной вершины main, что у ВЛИВАНИЙ (D-138 b).
 Строка ВЛИВАНИЯ — вливания в main не владельцем и без заявки (D-137): замена
 пробы BB-37 без администраторского права; ОБХОДЫ — другая величина и остаётся.
 Диапазон вливаний — от вершины main, запомненной прошлой сводкой (D-138 b), а
@@ -465,20 +466,35 @@ def line_standards(obs):
             f"расхождение рабочего дерева владельца отсюда не видно (D-121 §e)"), {"standards_age": age}, []
 
 
+def touches_checks(files):
+    return any(f == CHECKS_PATH or f.startswith(CHECKS_PATH + "/") for f in files)
+
+
 def line_checks(obs):
-    """Изменения .github/** на main за окно, по репозиториям (D-134): отказа за
-    ними нет, есть заметность — здесь и в блоке «Изменение проверок» гейта."""
+    """Коммиты, затронувшие .github/**, среди появившихся в main с прошлой сводки
+    (тот же диапазон, что у ВЛИВАНИЙ, D-138 b; не по дате коммиттера), по
+    репозиториям (D-134): отказа за ними нет, есть заметность — здесь и в
+    блоке «Изменение проверок» гейта. Файлы коммита не прочитались — «не наблюдалось»."""
     parts, fields, gaps = [], [], []
     for repo in CHECKS_REPOS:
-        commits, name = obs["checks"][repo], short(repo)
-        if isinstance(commits, Missing):
-            parts.append(f"{name}: не наблюдалось: {commits.reason}")
+        name, files = short(repo), obs["checks"][repo]
+        try:
+            commits, note = merges_range(name, obs["merges"][repo])
+            touched = []
+            for c in commits:
+                f = files.get(c["sha"], Missing("не запрошены"))
+                if isinstance(f, Missing):
+                    raise NotObserved(f"файлы коммита {c['sha'][:7]}: {f.reason}")
+                if touches_checks(f):
+                    touched.append(c["sha"])
+        except NotObserved as exc:
+            parts.append(f"{name}: не наблюдалось: {exc.reason}")
             fields.append(f"{name}:{NOT_OBSERVED}")
             gaps.append(name)
             continue
-        listed = f" ({', '.join(c['sha'][:7] for c in commits)})" if commits else ""
-        parts.append(f"{name}: {len(commits)}{listed}")
-        fields.append(f"{name}:{len(commits)}")
+        listed = f" ({', '.join(s[:7] for s in touched)})" if touched else ""
+        parts.append(f"{name}: {len(touched)}{listed}" + (f" ({note})" if note else ""))
+        fields.append(f"{name}:{len(touched)}")
     return "коммитов в .github/ на main — " + "; ".join(parts), {"checks_changed": ",".join(fields)}, gaps
 
 

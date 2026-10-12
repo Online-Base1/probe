@@ -94,16 +94,25 @@ def previous_digest(gh, repo, run_id, created):
     return None
 
 
-def checks_commits(gh, repo, start, end):
-    """Коммиты на main, затронувшие .github/, за окно."""
-    q = urllib.parse.quote
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
-    commits = get_pages(gh, f"/repos/{repo}/commits?path={dl.CHECKS_PATH}&sha=main"
-                            f"&since={q(start.strftime(fmt))}&until={q(end.strftime(fmt))}",
-                        f"contents:read на {dl.short(repo)}")
-    if isinstance(commits, dl.Missing):
-        return commits
-    return [{"sha": c["sha"], "date": c["commit"]["committer"]["date"]} for c in commits]
+# Файлов в ответе на коммит не больше 300; больше — список усечён.
+COMMIT_FILES_LIMIT = 300
+
+
+def commit_files(gh, repo, merges):
+    """Файлы каждого коммита диапазона ВЛИВАНИЙ (D-138 b): {sha: [пути] | Missing}."""
+    cmp = merges.get("compare")
+    if not isinstance(cmp, dict) or cmp.get("status") != "ahead":
+        return {}
+    out = {}
+    for c in cmp.get("commits") or []:
+        data = get(gh, f"/repos/{repo}/commits/{c['sha']}", f"contents:read на {dl.short(repo)}")
+        if isinstance(data, dl.Missing):
+            out[c["sha"]] = data
+        elif len(data.get("files") or []) >= COMMIT_FILES_LIMIT:
+            out[c["sha"]] = dl.Missing(f"файлов не меньше {COMMIT_FILES_LIMIT}, список усечён")
+        else:
+            out[c["sha"]] = [f["filename"] for f in data.get("files") or []]
+    return out
 
 
 def previous_heads(gh, repo, previous):
@@ -217,6 +226,7 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
             branch_exists[ref] = True if status == 200 else False if status == 404 else \
                 dl.Missing(why(status, headers, "contents:read на probe"))
 
+    merges = {repo: merges_of(tokens[repo], repo, heads) for repo in dl.MERGES_REPOS}
     return {
         "now": now,
         "own_run_id": own_run_id,
@@ -232,8 +242,8 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
                                          "contents:read на online-base"),
         "standards_last": last_commit_date(gh_knowledge, rl.KNOWLEDGE_REPO, dl.STANDARDS_PATH,
                                            "contents:read на factory-knowledge"),
-        "checks": {repo: checks_commits(tokens[repo], repo, start, end) for repo in dl.CHECKS_REPOS},
-        "merges": {repo: merges_of(tokens[repo], repo, heads) for repo in dl.MERGES_REPOS},
+        "merges": merges,
+        "checks": {repo: commit_files(tokens[repo], repo, merges[repo]) for repo in dl.CHECKS_REPOS},
     }
 
 
