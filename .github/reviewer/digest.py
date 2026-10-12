@@ -7,7 +7,7 @@ Missing(причина) и даёт строку «не наблюдалось»
 
 Токены (окружение, не печатаются):
   GH_TOKEN_READ      — github.token прогона: actions/contents/pull-requests:read на probe;
-  GH_TOKEN_KNOWLEDGE — приложение ревьюера, factory-knowledge, contents:read (строка ПРАВИЛА);
+  GH_TOKEN_KNOWLEDGE — приложение ревьюера, factory-knowledge, contents:read + pull-requests:read (ПРАВИЛА, ВЛИВАНИЯ);
   GH_TOKEN_DIGEST    — приложение ревьюера, factory-knowledge, issues:write (только публикация).
 Права ни одного из них не расширяются: чего не хватает, то печатается как
 «не наблюдалось: нет права <какое>» — право называет сама площадка
