@@ -7,7 +7,11 @@
 последняя строка — СВОДКА ПОЛНАЯ / СВОДКА НЕПОЛНАЯ.
 
 Поправки к составу: строка ЖУРНАЛ считается по main (D-124 §c.4); строка
-ОБХОДЫ — по репозиториям, с признаком, разрешён ли обход (D-129 §c).
+ОБХОДЫ — по репозиториям, с признаком, разрешён ли обход (D-129 §c); признак
+не прочитан — N/unknown, и репозиторий называется в СВОДКА НЕПОЛНАЯ (D-133 b).
+Ночь — последний canary-trigger по расписанию; ручные прогоны в ночь не входят
+(D-133 c). Окно — от предыдущей сводки до текущей, первая берёт 24 ч (D-133 d).
+Десятая строка — изменения .github/** за окно по репозиториям (D-134).
 
 Всё, что приходит из сети, передаётся сюда уже полученным (digest.py); то,
 что получить не удалось, приходит как Missing(причина). Так каждая строка
@@ -26,13 +30,20 @@ DIGEST_ISSUE = 12
 
 PROBE_REPO = "Online-Base1/probe"
 ONLINE_BASE_REPO = "Online-Base1/online-base"
+FACTORY_CI_REPO = "Online-Base1/factory-ci"
+COST_PANEL_REPO = "Online-Base1/cost-panel"
 WORKLOG_PATH = "docs/06-worklog"   # D-115 §c; по main (D-124 §c.4)
 STANDARDS_PATH = "standards"       # BB-39; по main factory-knowledge
 # Обходы — по репозиториям (D-129 §c): ноль значит разное там, где обход
 # разрешён, и там, где он невозможен по настройке.
 BYPASS_REPOS = (PROBE_REPO, rl.KNOWLEDGE_REPO, ONLINE_BASE_REPO)
+# Изменения проверок (.github/**) за окно — по репозиториям (D-134): чьи гейты
+# и откуда они берутся (factory-ci). Недоступный токену — «не наблюдалось».
+CHECKS_PATH = ".github"
+CHECKS_REPOS = (PROBE_REPO, FACTORY_CI_REPO, rl.KNOWLEDGE_REPO, ONLINE_BASE_REPO, COST_PANEL_REPO)
+PER_REPO_LINES = {"bypass", "checks"}
 
-WINDOW_HOURS = 24
+FIRST_WINDOW_HOURS = 24
 NOT_OBSERVED = "not_observed"
 
 # Порядок строк и полей DIGEST не меняется: из DIGEST потом наполняется учёт
@@ -47,21 +58,23 @@ LINES = (
     ("worklog", "ЖУРНАЛ"),
     ("models", "МОДЕЛИ"),
     ("standards", "ПРАВИЛА"),
+    ("checks", "ИЗМЕНЕНИЕ ПРОВЕРОК"),
 )
 FIELDS_OF = {
     "night": ("runs", "red", "unknown"),
     "reviewer": ("reviewer", "findings"),
     "canary": ("canary",),
     "retention": ("retention", "expires_in"),
-    "bypass": ("bypass_24h", "bypass_total"),
+    "bypass": ("bypass_24h", "bypass_30d"),
     "prless": ("prless_branch",),
     "worklog": ("worklog_age",),
     "models": ("models",),
     "standards": ("standards_age",),
+    "checks": ("checks_changed",),
 }
 DIGEST_FIELDS = ("seq", "date", "runs", "red", "unknown", "reviewer", "findings", "canary", "retention",
-                 "expires_in", "bypass_24h", "bypass_total", "prless_branch", "worklog_age", "models",
-                 "standards_age", "complete")
+                 "expires_in", "bypass_24h", "bypass_30d", "prless_branch", "worklog_age", "models",
+                 "standards_age", "checks_changed", "complete")
 
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required", "cancelled", "stale"}
 MODEL_CHECKS = ("в", "г", "д")
@@ -98,8 +111,29 @@ def parse_time(s):
     return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
 
 
-def window(now):
-    return now - datetime.timedelta(hours=WINDOW_HOURS), now
+def digest_window(now, own_created, previous):
+    """Окно сводки (D-133 d): от предыдущей опубликованной сводки до текущей.
+
+    own_created — время создания своего прогона (конец окна; так окна
+    соседних сводок стыкуются без зазора и без перекрытия); previous —
+    {id, created_at} предыдущей успешной сводки, None или Missing.
+    Первая сводка берёт 24 ч и говорит об этом.
+    """
+    end = parse_time(own_created) if isinstance(own_created, str) else now
+    first = end - datetime.timedelta(hours=FIRST_WINDOW_HOURS)
+    if isinstance(previous, Missing):
+        return first, end, f"предыдущая сводка не прочитана ({previous.reason}): окно 24 ч"
+    if previous is None:
+        return first, end, "первая сводка: окно 24 ч"
+    return parse_time(previous["created_at"]), end, f"от предыдущей сводки {previous['id']}"
+
+
+def window_of(obs):
+    return digest_window(obs["now"], obs["own_created"], obs["previous_digest"])
+
+
+def in_window(runs, start, end):
+    return [r for r in runs if start <= parse_time(r["created_at"]) < end]
 
 
 def workflow_file(run):
@@ -128,43 +162,50 @@ def model_checks_of(log):
 # --- ночной прогон ---
 
 def nightly(obs):
-    """Ночной прогон canary-trigger за окно и журнал ревьюера по нему.
+    """Ночной прогон и журнал ревьюера по нему → (прогон, ревьюер, журнал, пометка).
 
-    Ночных прогонов несколько — НЕ выбирается ни один: правило выбора не
-    принято, это вопрос к «Архитектуре», и строки, зависящие от ночного
-    прогона, честно не наблюдаются.
+    Ночь — то, что происходит без человека (D-133 c): берётся ПОСЛЕДНИЙ
+    canary-trigger с событием schedule; ручные прогоны в ночь не входят (их
+    видно в строке НОЧЬ). Прогонов по расписанию несколько — множественность
+    называется в строке.
     """
-    runs = need(obs["runs"])
-    night = sorted((r for r in runs if workflow_file(r) == rl.CANARY_WORKFLOW_PATH), key=lambda r: r["created_at"])
+    start, end, _ = window_of(obs)
+    canary = [r for r in in_window(need(obs["runs"]), start, end) if workflow_file(r) == rl.CANARY_WORKFLOW_PATH]
+    night = sorted((r for r in canary if r.get("event") == "schedule"), key=lambda r: r["created_at"])
     if not night:
-        raise NotObserved("ночного прогона не было: canary-trigger за окно не запускался")
-    if len(night) > 1:
-        ids = ", ".join(f"{r['id']} ({r.get('event')})" for r in night)
-        raise NotObserved(f"ночных прогонов {len(night)}: {ids}; правило выбора не принято — вопрос к «Архитектуре»")
-    cr = night[0]
+        manual = len(canary)
+        raise NotObserved("прогона по расписанию не было" +
+                          (f"; ручных прогонов canary-trigger: {manual} — в ночь не входят" if manual else ""))
+    cr = night[-1]
+    note = f"прогонов по расписанию: {len(night)}, взят последний {cr['id']}" if len(night) > 1 else ""
     unread = []
     for rid, log in sorted(obs["reviewer_logs"].items()):
         if isinstance(log, Missing):
             unread.append(f"{rid}: {log.reason}")
         elif upstream_of(log) == (str(cr["id"]), "canary"):
-            return cr, rid, log
+            return cr, rid, log, note
     if unread:
         raise NotObserved(f"ревьюер по ночному прогону {cr['id']} не найден; не прочитаны журналы {'; '.join(unread)}")
     raise NotObserved(f"ревьюер по ночному прогону {cr['id']} за окно не отчитался")
 
 
+def with_note(text, note):
+    return f"{text} ({note})" if note else text
+
+
 def nightly_ledger(obs):
-    cr, rid, log = nightly(obs)
+    cr, rid, log, note = nightly(obs)
     ledger = ledger_of(log)
     if ledger is None:
         raise NotObserved(f"в журнале ревьюера {rid} нет строки REVIEW_LEDGER")
-    return cr, rid, log, ledger
+    return cr, rid, ledger, note
 
 
 # --- девять строк: (текст, поля DIGEST, пробелы) ---
 
 def line_night(obs):
-    runs = [r for r in need(obs["runs"]) if str(r["id"]) != str(obs["own_run_id"])]
+    start, end, _ = window_of(obs)
+    runs = [r for r in in_window(need(obs["runs"]), start, end) if str(r["id"]) != str(obs["own_run_id"])]
     red = sum(1 for r in runs if r.get("conclusion") in RED_CONCLUSIONS)
     unfinished = sum(1 for r in runs if r.get("status") != "completed")
     logs = obs["reviewer_logs"]
@@ -186,17 +227,18 @@ def line_night(obs):
 
 
 def line_reviewer(obs):
-    cr, rid, _, ledger = nightly_ledger(obs)
+    cr, rid, ledger, note = nightly_ledger(obs)
     result, findings = ledger.get("result", NOT_OBSERVED), ledger.get("findings", NOT_OBSERVED)
-    return f"{result}, находок {findings} (ревьюер {rid} по ночному прогону {cr['id']})", \
+    return with_note(f"{result}, находок {findings} (ревьюер {rid} по ночному прогону {cr['id']})", note), \
         {"reviewer": result, "findings": findings}, []
 
 
 def line_canary(obs):
-    _, rid, _, ledger = nightly_ledger(obs)
+    _, rid, ledger, note = nightly_ledger(obs)
     canary = ledger.get("canary", NOT_OBSERVED)
     meaning = {"PASS": "заложенный дефект найден", "FAIL": "заложенный дефект НЕ найден"}.get(canary, "")
-    return f"{canary}" + (f" — {meaning}" if meaning else "") + f" (ревьюер {rid})", {"canary": canary}, []
+    return with_note(f"{canary}" + (f" — {meaning}" if meaning else "") + f" (ревьюер {rid})", note), \
+        {"canary": canary}, []
 
 
 def expires_in(retention, oldest_created, today):
@@ -208,22 +250,24 @@ def expires_in(retention, oldest_created, today):
 
 
 def line_retention(obs):
-    _, rid, _, ledger = nightly_ledger(obs)
+    _, rid, ledger, note = nightly_ledger(obs)
     retention = ledger.get("retention")
     if not retention:
         raise NotObserved(f"в REVIEW_LEDGER ревьюера {rid} нет поля retention")
     if not retention.startswith("observed="):
         why = {rl.RETENTION_NOT_OBSERVED: "своего прогона старше N дней ещё нет (D-108)",
                rl.RETENTION_FAILED: "журнал старого прогона не читается — красный (D-108 §c)"}.get(retention, "")
-        return f"{retention}" + (f" — {why}" if why else "") + "; дата истечения не считается, пока срок не наблюдён", \
+        return with_note(f"{retention}" + (f" — {why}" if why else "") +
+                         "; дата истечения не считается, пока срок не наблюдён", note), \
             {"retention": retention, "expires_in": NOT_OBSERVED}, []
     oldest = obs["oldest_reviewer_created"]
     if isinstance(oldest, Missing) or oldest is None:
         reason = oldest.reason if isinstance(oldest, Missing) else "самый старый прогон ревьюера не найден"
-        return f"{retention}; до самой ранней даты истечения — не наблюдалось: {reason}", \
+        return with_note(f"{retention}; до самой ранней даты истечения — не наблюдалось: {reason}", note), \
             {"retention": retention, "expires_in": NOT_OBSERVED}, [reason]
     n = expires_in(retention, oldest, obs["now"].date())
-    return f"{retention}; до самой ранней даты истечения {n} дн. (самый старый прогон ревьюера от {oldest[:10]})", \
+    return with_note(f"{retention}; до самой ранней даты истечения {n} дн. "
+                     f"(самый старый прогон ревьюера от {oldest[:10]})", note), \
         {"retention": retention, "expires_in": n}, []
 
 
@@ -232,6 +276,10 @@ def short(repo):
 
 
 def line_bypass(obs):
+    """По репозиториям (D-129 §c, D-133 b). Число и признак — разные величины:
+    число не вычислено — репозиторий «не наблюдалось»; число есть, признак не
+    прочитан — N/unknown. В обоих случаях репозиторий — пробел сводки:
+    unknown — долг, а не нормальное состояние."""
     parts, day_f, all_f, gaps = [], [], [], []
     for repo in BYPASS_REPOS:
         b, name = obs["bypass"][repo], short(repo)
@@ -241,11 +289,11 @@ def line_bypass(obs):
             parts.append(f"{name}: не наблюдалось: {reason}")
             day_f.append(f"{name}:{NOT_OBSERVED}")
             all_f.append(f"{name}:{NOT_OBSERVED}")
-            gaps.append(f"{name}: {reason}")
+            gaps.append(name)
             continue
         if isinstance(allowed, Missing):
             flag, note = "unknown", f"разрешён ли обход — не наблюдалось: {allowed.reason}"
-            gaps.append(f"{name}: {allowed.reason}")
+            gaps.append(name)
         elif allowed:
             flag, note = "allowed", "обход разрешён настройкой"
         else:
@@ -253,7 +301,7 @@ def line_bypass(obs):
         parts.append(f"{name}: за сутки {len(day)}, за 30 дней {len(total)}; {note}")
         day_f.append(f"{name}:{len(day)}/{flag}")
         all_f.append(f"{name}:{len(total)}/{flag}")
-    return "; ".join(parts), {"bypass_24h": ",".join(day_f), "bypass_total": ",".join(all_f)}, gaps
+    return "; ".join(parts), {"bypass_24h": ",".join(day_f), "bypass_30d": ",".join(all_f)}, gaps
 
 
 def line_prless(obs):
@@ -290,37 +338,59 @@ def line_worklog(obs):
 
 
 def line_models(obs):
-    _, rid, log = nightly(obs)
+    _, rid, log, note = nightly(obs)
     checks = model_checks_of(log)
     if set(checks) != set(MODEL_CHECKS):
         raise NotObserved(f"в журнале ревьюера {rid} нет проверок (в)(г)(д): ревью до них не дошло")
     text = ", ".join(f"({k}) {checks[k]}" for k in MODEL_CHECKS)
     value = "PASS" if all(checks[k] == "PASS" for k in MODEL_CHECKS) else ",".join(f"{k}={checks[k]}" for k in MODEL_CHECKS)
-    return f"{text} (ревьюер {rid})", {"models": value}, []
+    return with_note(f"{text} (ревьюер {rid})", note), {"models": value}, []
 
 
 def line_standards(obs):
     age = age_days(obs["standards_last"], obs["now"].date(), STANDARDS_PATH + "/")
-    return (f"{age} дн. с последнего коммита в {STANDARDS_PATH}/ factory-knowledge@main — косвенно: "
+    return (f"{age} дн. с последнего коммита в {STANDARDS_PATH}/ на main factory-knowledge — косвенно: "
             f"расхождение рабочего дерева владельца отсюда не видно (D-121 §e)"), {"standards_age": age}, []
+
+
+def line_checks(obs):
+    """Изменения .github/** на main за окно, по репозиториям (D-134): отказа за
+    ними нет, есть заметность — здесь и в блоке «Изменение проверок» гейта."""
+    parts, fields, gaps = [], [], []
+    for repo in CHECKS_REPOS:
+        commits, name = obs["checks"][repo], short(repo)
+        if isinstance(commits, Missing):
+            parts.append(f"{name}: не наблюдалось: {commits.reason}")
+            fields.append(f"{name}:{NOT_OBSERVED}")
+            gaps.append(name)
+            continue
+        listed = f" ({', '.join(c['sha'][:7] for c in commits)})" if commits else ""
+        parts.append(f"{name}: {len(commits)}{listed}")
+        fields.append(f"{name}:{len(commits)}")
+    return "коммитов в .github/ на main — " + "; ".join(parts), {"checks_changed": ",".join(fields)}, gaps
 
 
 LINE_FUNCS = {"night": line_night, "reviewer": line_reviewer, "canary": line_canary, "retention": line_retention,
               "bypass": line_bypass, "prless": line_prless, "worklog": line_worklog, "models": line_models,
-              "standards": line_standards}
+              "standards": line_standards, "checks": line_checks}
 
 
 def compute_line(key, obs):
-    """Строка всегда есть: невычисленная — «не наблюдалось: <причина>» (BB-28)."""
+    """Строка всегда есть: невычисленная — «не наблюдалось: <причина>» (BB-28).
+
+    → (текст, поля, пробелы, репозитории-пробелы). Для строк по репозиториям
+    пробел — имя репозитория: он называется в СВОДКА НЕПОЛНАЯ (D-133 b).
+    """
     try:
         text, fields, gaps = LINE_FUNCS[key](obs)
+        repos = gaps if key in PER_REPO_LINES else []
     except NotObserved as exc:
-        text, fields, gaps = f"не наблюдалось: {exc.reason}", {}, [exc.reason]
+        text, fields, gaps, repos = f"не наблюдалось: {exc.reason}", {}, [exc.reason], []
     except Exception as exc:  # пропуск строки — дефект: ошибка кода тоже печатается
         reason = f"ошибка вычисления {type(exc).__name__}"
-        text, fields, gaps = f"не наблюдалось: {reason}", {}, [reason]
+        text, fields, gaps, repos = f"не наблюдалось: {reason}", {}, [reason], []
     fields = {f: fields.get(f, NOT_OBSERVED) for f in FIELDS_OF[key]}
-    return text, fields, gaps
+    return text, fields, gaps, repos
 
 
 def _value(v):
@@ -332,23 +402,26 @@ def digest_line(values):
 
 
 def build(obs, seq):
-    """Комментарий сводки → (тело, строка DIGEST, список невычисленных строк)."""
-    start, end = window(obs["now"])
+    """Комментарий сводки → (тело, строка DIGEST, перечень невычисленного)."""
+    start, end, note = window_of(obs)
     date = end.date().isoformat()
     values = {"seq": seq, "date": date}
     human, incomplete = [], []
     for key, title in LINES:
-        text, fields, gaps = compute_line(key, obs)
+        text, fields, gaps, repos = compute_line(key, obs)
         values.update(fields)
-        human.append(rl.clean(f"{title}: {text}", 900))
+        human.append(rl.clean(f"{title}: {text}", 1200))
         if gaps:
-            incomplete.append((key, title))
-    values["complete"] = "yes" if not incomplete else "no:" + ",".join(k for k, _ in incomplete)
+            incomplete.append((key, title, repos))
+    values["complete"] = "yes" if not incomplete else "no:" + ",".join(
+        k + (f"({'+'.join(r)})" if r else "") for k, _, r in incomplete)
     dline = digest_line(values)
-    last = "СВОДКА ПОЛНАЯ" if not incomplete else "СВОДКА НЕПОЛНАЯ: " + ", ".join(t for _, t in incomplete)
+    labels = [t + (f" ({', '.join(r)})" if r else "") for _, t, r in incomplete]
+    last = "СВОДКА ПОЛНАЯ" if not incomplete else "СВОДКА НЕПОЛНАЯ: " + ", ".join(labels)
     body = "\n".join([
         f"<!-- factory-digest seq={seq} date={date} -->",
-        f"**Ночная сводка {date}** · окно {start:%Y-%m-%dT%H:%MZ} … {end:%Y-%m-%dT%H:%MZ} · прогон сводки {obs['own_run_id']}",
+        f"**Ночная сводка {date}** · окно {start:%Y-%m-%dT%H:%MZ} … {end:%Y-%m-%dT%H:%MZ} ({note}) · "
+        f"прогон сводки {obs['own_run_id']}",
         "",
         "```text",
         *human,
@@ -358,4 +431,4 @@ def build(obs, seq):
         "",
         last,
     ]) + "\n"
-    return body, dline, [t for _, t in incomplete]
+    return body, dline, labels

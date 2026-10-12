@@ -128,9 +128,9 @@ class Workflows(unittest.TestCase):
         self.assertNotIn("workflow_run", t.split("\nname: digest\n", 1)[1])
         self.assertRegex(t, r"(?m)^permissions: \{\}$")
         self.assertNotIn("digest", read("canary-trigger.yml"))
-        canary = re.search(r'cron: "(\d+) (\d+) \* \* \*"', read("canary-trigger.yml")).groups()
-        digest = re.search(r'cron: "(\d+) (\d+) \* \* \*"', t).groups()
-        self.assertEqual(int(digest[1]) * 60 + int(digest[0]), int(canary[1]) * 60 + int(canary[0]) + 30)
+        # D-133 d: расписание не является временем; построение «через N минут
+        # после» недействительно — сводка в 12:00 UTC, окно от прошлой сводки.
+        self.assertEqual(re.findall(r'cron: "([^"]+)"', t), ["0 12 * * *"])
 
     def test_digest_token_scopes(self):
         t = read("digest.yml")

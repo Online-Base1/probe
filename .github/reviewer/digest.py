@@ -26,6 +26,7 @@ import reviewer as rv  # noqa: E402
 import reviewer_lib as rl  # noqa: E402
 
 REVIEWER_PATH = ".github/workflows/" + rl.REVIEWER_WORKFLOW_FILE
+DIGEST_WORKFLOW_FILE = "digest.yml"
 
 
 def _header(headers, name):
@@ -71,6 +72,36 @@ def get_pages(gh, path, right, key=None, limit=10):
     return dl.Missing(f"слишком много страниц ({right})")
 
 
+def own_created(gh, repo, run_id):
+    run = get(gh, f"/repos/{repo}/actions/runs/{run_id}", "actions:read на probe") if run_id else \
+        dl.Missing("GITHUB_RUN_ID не задан")
+    return run if isinstance(run, dl.Missing) else run["created_at"]
+
+
+def previous_digest(gh, repo, run_id, created):
+    """Последняя успешная (= опубликованная) сводка до своего прогона: {id, created_at} или None."""
+    runs = get(gh, f"/repos/{repo}/actions/workflows/{DIGEST_WORKFLOW_FILE}/runs?status=success&per_page=20",
+               "actions:read на probe")
+    if isinstance(runs, dl.Missing):
+        return runs
+    for r in runs.get("workflow_runs") or []:
+        if str(r["id"]) != str(run_id) and (not isinstance(created, str) or r["created_at"] < created):
+            return {"id": r["id"], "created_at": r["created_at"]}
+    return None
+
+
+def checks_commits(gh, repo, start, end):
+    """Коммиты на main, затронувшие .github/, за окно."""
+    q = urllib.parse.quote
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    commits = get_pages(gh, f"/repos/{repo}/commits?path={dl.CHECKS_PATH}&sha=main"
+                            f"&since={q(start.strftime(fmt))}&until={q(end.strftime(fmt))}",
+                        f"contents:read на {dl.short(repo)}")
+    if isinstance(commits, dl.Missing):
+        return commits
+    return [{"sha": c["sha"], "date": c["commit"]["committer"]["date"]} for c in commits]
+
+
 def last_commit_date(gh, repo, path, right):
     q = urllib.parse.quote
     commits = get(gh, f"/repos/{repo}/commits?path={q(path)}&sha=main&per_page=1", right)
@@ -110,14 +141,16 @@ def bypass_of(gh, repo):
 
 def collect(gh_read, gh_knowledge, now, own_run_id):
     """Все источники сводки; каждый — данные либо Missing."""
-    start, _ = dl.window(now)
     probe = dl.PROBE_REPO
-    created = urllib.parse.quote(">=" + start.strftime("%Y-%m-%dT%H:%M:%SZ"))
-    runs = get_pages(gh_read, f"/repos/{probe}/actions/runs?created={created}", "actions:read на probe",
+    created = own_created(gh_read, probe, own_run_id)
+    previous = previous_digest(gh_read, probe, own_run_id, created)
+    start, end, _ = dl.digest_window(now, created, previous)
+    since = urllib.parse.quote(">=" + start.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    runs = get_pages(gh_read, f"/repos/{probe}/actions/runs?created={since}", "actions:read на probe",
                      key="workflow_runs")
     reviewer_logs = {}
     if not isinstance(runs, dl.Missing):
-        for r in runs:
+        for r in dl.in_window(runs, start, end):
             if dl.workflow_file(r) != REVIEWER_PATH or str(r["id"]) == str(own_run_id):
                 continue
             if r.get("status") != "completed":
@@ -126,7 +159,11 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
             status, text = rv.run_log_text(gh_read, probe, r["id"])
             reviewer_logs[r["id"]] = text if status == 200 else dl.Missing(f"журнал прогона {r['id']}: HTTP {status}")
 
-    tokens = {probe: gh_read, rl.KNOWLEDGE_REPO: gh_knowledge, dl.ONLINE_BASE_REPO: gh_read}
+    # Токен на репозиторий: probe и публичные — github.token; factory-knowledge —
+    # contents:read приложения ревьюера; online-base и cost-panel токенам сводки
+    # не видны — «не наблюдалось», права не добавляются.
+    tokens = {probe: gh_read, dl.FACTORY_CI_REPO: gh_read, rl.KNOWLEDGE_REPO: gh_knowledge,
+              dl.ONLINE_BASE_REPO: gh_read, dl.COST_PANEL_REPO: gh_read}
     open_prs = get_pages(gh_read, f"/repos/{probe}/pulls?state=open", "pull-requests:read на probe")
     branch_exists = {}
     if not isinstance(open_prs, dl.Missing):
@@ -141,6 +178,8 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
     return {
         "now": now,
         "own_run_id": own_run_id,
+        "own_created": created,
+        "previous_digest": previous,
         "runs": runs,
         "reviewer_logs": reviewer_logs,
         "oldest_reviewer_created": oldest_completed_run(gh_read, probe, rl.REVIEWER_WORKFLOW_FILE),
@@ -151,6 +190,7 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
                                          "contents:read на online-base"),
         "standards_last": last_commit_date(gh_knowledge, rl.KNOWLEDGE_REPO, dl.STANDARDS_PATH,
                                            "contents:read на factory-knowledge"),
+        "checks": {repo: checks_commits(tokens[repo], repo, start, end) for repo in dl.CHECKS_REPOS},
     }
 
 

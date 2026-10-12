@@ -47,6 +47,8 @@ def obs(**over):
         "runs": [run(CANARY_RUN, "canary-trigger.yml"),
                  run(REVIEWER_RUN, "reviewer.yml", event="workflow_run", created="2026-10-12T10:07:21Z"),
                  run(OWN_RUN, "digest.yml", status="in_progress", conclusion=None, created="2026-10-12T10:47:00Z")],
+        "own_created": "2026-10-12T10:47:00Z",
+        "previous_digest": None,
         "reviewer_logs": {REVIEWER_RUN: reviewer_log()},
         "oldest_reviewer_created": "2026-09-28T19:00:00Z",
         "bypass": {r: {"day": [], "all": [{"id": 1}], "allowed": True} for r in dl.BYPASS_REPOS},
@@ -54,6 +56,7 @@ def obs(**over):
         "branch_exists": {},
         "worklog_last": "2026-10-11T08:00:00Z",
         "standards_last": "2026-10-10T08:00:00Z",
+        "checks": {r: [] for r in dl.CHECKS_REPOS},
     }
     o.update(over)
     return o
@@ -77,9 +80,9 @@ def digest_fields(dline):
 class Shape(unittest.TestCase):
     def assertShape(self, body, dline):
         human = lines_of(body)
-        self.assertEqual([h.split(":", 1)[0] for h in human[:9]], TITLES)
-        self.assertEqual(human[9], "")
-        self.assertEqual(human[10], dline)
+        self.assertEqual([h.split(":", 1)[0] for h in human[:10]], TITLES)
+        self.assertEqual(human[10], "")
+        self.assertEqual(human[11], dline)
         self.assertEqual(digest_fields(dline), list(dl.DIGEST_FIELDS))
         self.assertNotRegex(dline, r"=(\s|$)")
         last = body.rstrip("\n").split("\n")[-1]
@@ -93,8 +96,12 @@ class Shape(unittest.TestCase):
         self.assertEqual(dline, "DIGEST seq=7 date=2026-10-12 runs=2 red=0 unknown=0 reviewer=DONE findings=1 "
                                 "canary=PASS retention=not_observed expires_in=not_observed "
                                 "bypass_24h=probe:0/allowed,factory-knowledge:0/allowed,online-base:0/allowed "
-                                "bypass_total=probe:1/allowed,factory-knowledge:1/allowed,online-base:1/allowed "
-                                "prless_branch=0 worklog_age=1 models=PASS standards_age=2 complete=yes")
+                                "bypass_30d=probe:1/allowed,factory-knowledge:1/allowed,online-base:1/allowed "
+                                "prless_branch=0 worklog_age=1 models=PASS standards_age=2 "
+                                "checks_changed=probe:0,factory-ci:0,factory-knowledge:0,online-base:0,cost-panel:0 "
+                                "complete=yes")
+        self.assertIn("(первая сводка: окно 24 ч)", body)
+        self.assertIn("окно 2026-10-11T10:47Z … 2026-10-12T10:47Z", body)
 
     def test_no_nightly_run_at_all(self):
         # Ночной прогон не запустился вовсе: сводка обязана выйти, строки — «не наблюдалось».
@@ -103,7 +110,7 @@ class Shape(unittest.TestCase):
         self.assertShape(body, dline)
         for title in ("РЕВЬЮЕР", "КАНАРЕЙКА", "СРОК ХРАНЕНИЯ", "МОДЕЛИ"):
             self.assertEqual(line(body, title),
-                             f"{title}: не наблюдалось: ночного прогона не было: canary-trigger за окно не запускался")
+                             f"{title}: не наблюдалось: прогона по расписанию не было")
         self.assertEqual(line(body, "НОЧЬ"), "НОЧЬ: прогонов 0, красных 0, UNKNOWN 0 (из 0 прогонов ревьюера)")
         self.assertEqual(incomplete, ["РЕВЬЮЕР", "КАНАРЕЙКА", "СРОК ХРАНЕНИЯ", "МОДЕЛИ"])
         self.assertTrue(body.endswith("СВОДКА НЕПОЛНАЯ: РЕВЬЮЕР, КАНАРЕЙКА, СРОК ХРАНЕНИЯ, МОДЕЛИ\n"))
@@ -117,14 +124,21 @@ class Shape(unittest.TestCase):
         self.assertEqual(line(body, "НОЧЬ"), "НОЧЬ: не наблюдалось: нет права actions:read (HTTP 403)")
         self.assertIn("НОЧЬ", incomplete)
 
-    def test_every_line_missing_still_nine_lines(self):
+    def test_every_line_missing_still_ten_lines(self):
         m = dl.Missing("нет")
         o = obs(runs=m, oldest_reviewer_created=m, open_prs=m, worklog_last=m, standards_last=m,
                 bypass={r: {"day": m, "all": m, "allowed": m} for r in dl.BYPASS_REPOS})
         body, dline, incomplete = dl.build(o, 1)
         self.assertShape(body, dline)
-        self.assertEqual(incomplete, TITLES)
-        self.assertTrue(all("не наблюдалось" in h for h in lines_of(body)[:9]))
+        o["checks"] = {r: m for r in dl.CHECKS_REPOS}
+        body, dline, incomplete = dl.build(o, 1)
+        self.assertShape(body, dline)
+        self.assertEqual(incomplete, [
+            "НОЧЬ", "РЕВЬЮЕР", "КАНАРЕЙКА", "СРОК ХРАНЕНИЯ", "ОБХОДЫ (probe, factory-knowledge, online-base)",
+            "ЗАЯВКИ БЕЗ ВЕТКИ", "ЖУРНАЛ", "МОДЕЛИ", "ПРАВИЛА",
+            "ИЗМЕНЕНИЕ ПРОВЕРОК (probe, factory-ci, factory-knowledge, online-base, cost-panel)"])
+        self.assertTrue(all("не наблюдалось" in h for h in lines_of(body)[:10]))
+        self.assertIn("complete=no:night,reviewer,canary,retention,bypass(probe+factory-knowledge+online-base),", dline)
 
     def test_code_error_is_printed_not_skipped(self):
         o = obs(worklog_last="not-a-date")  # ошибка разбора не должна съесть строку
@@ -135,15 +149,31 @@ class Shape(unittest.TestCase):
 
 
 class Nightly(unittest.TestCase):
-    def test_several_nightly_runs_not_chosen(self):
-        o = obs(runs=[run(1, "canary-trigger.yml"), run(2, "canary-trigger.yml", event="workflow_dispatch",
-                                                         created="2026-10-12T10:30:58Z")],
-                reviewer_logs={3: reviewer_log(upstream=1), 4: reviewer_log(upstream=2)})
+    def test_several_schedule_runs_last_taken(self):
+        # D-133 c: берётся последний по расписанию, множественность называется.
+        o = obs(runs=[run(1, "canary-trigger.yml"), run(2, "canary-trigger.yml", created="2026-10-12T10:30:58Z")],
+                reviewer_logs={3: reviewer_log(upstream=1, result="UNKNOWN(x)"), 4: reviewer_log(upstream=2)})
         body, _, incomplete = dl.build(o, 1)
-        self.assertEqual(line(body, "РЕВЬЮЕР"),
-                         "РЕВЬЮЕР: не наблюдалось: ночных прогонов 2: 1 (schedule), 2 (workflow_dispatch); "
-                         "правило выбора не принято — вопрос к «Архитектуре»")
-        self.assertIn("КАНАРЕЙКА", incomplete)
+        self.assertEqual(line(body, "РЕВЬЮЕР"), "РЕВЬЮЕР: DONE, находок 1 (ревьюер 4 по ночному прогону 2) "
+                                                "(прогонов по расписанию: 2, взят последний 2)")
+        self.assertIn("(прогонов по расписанию: 2, взят последний 2)", line(body, "КАНАРЕЙКА"))
+        self.assertEqual(incomplete, [])
+
+    def test_manual_run_is_not_the_night(self):
+        # Ручной прогон позже ночного — в ночь не входит; в НОЧЬ он считается.
+        o = obs(runs=[run(1, "canary-trigger.yml"),
+                      run(2, "canary-trigger.yml", event="workflow_dispatch", created="2026-10-12T10:30:58Z")],
+                reviewer_logs={3: reviewer_log(upstream=1), 4: reviewer_log(upstream=2, result="UNKNOWN(x)")})
+        body, _, _ = dl.build(o, 1)
+        self.assertEqual(line(body, "РЕВЬЮЕР"), "РЕВЬЮЕР: DONE, находок 1 (ревьюер 3 по ночному прогону 1)")
+        self.assertIn("НОЧЬ: прогонов 2, красных 0, UNKNOWN 1 (из 2 прогонов ревьюера)", body)
+
+    def test_only_manual_runs_not_observed(self):
+        o = obs(runs=[run(2, "canary-trigger.yml", event="workflow_dispatch")], reviewer_logs={4: reviewer_log(upstream=2)})
+        body, _, incomplete = dl.build(o, 1)
+        self.assertEqual(line(body, "РЕВЬЮЕР"), "РЕВЬЮЕР: не наблюдалось: прогона по расписанию не было; "
+                                                "ручных прогонов canary-trigger: 1 — в ночь не входят")
+        self.assertIn("МОДЕЛИ", incomplete)
 
     def test_reviewer_of_other_run_not_taken(self):
         o = obs(reviewer_logs={REVIEWER_RUN: reviewer_log(upstream=111, trigger="agent")})
@@ -181,6 +211,39 @@ class Nightly(unittest.TestCase):
         self.assertIn("(г) FAIL", line(body, "МОДЕЛИ"))
 
 
+class Window(unittest.TestCase):
+    """D-133 d: окно — от предыдущей сводки до текущей; первая — 24 ч."""
+
+    def test_from_previous_digest(self):
+        prev = {"id": 38280526382, "created_at": "2026-10-11T16:53:28Z"}
+        o = obs(previous_digest=prev,
+                runs=[run(9, "ci.yml", conclusion="failure", created="2026-10-11T16:00:00Z"),  # до окна
+                      run(CANARY_RUN, "canary-trigger.yml"),
+                      run(REVIEWER_RUN, "reviewer.yml", event="workflow_run", created="2026-10-12T10:07:21Z")])
+        body, dline, _ = dl.build(o, 2)
+        self.assertIn("окно 2026-10-11T16:53Z … 2026-10-12T10:47Z (от предыдущей сводки 38280526382)", body)
+        self.assertIn(" runs=2 red=0 ", dline)
+
+    def test_long_gap_covers_all_days(self):
+        # Сводка не выходила трое суток — окно тянется от последней вышедшей.
+        prev = {"id": 1, "created_at": "2026-10-09T12:00:00Z"}
+        o = obs(previous_digest=prev, runs=[run(9, "ci.yml", conclusion="failure", created="2026-10-10T01:00:00Z")])
+        _, dline, _ = dl.build(o, 2)
+        self.assertIn(" runs=1 red=1 ", dline)
+
+    def test_end_is_own_run_created(self):
+        # Прогон, созданный после своего (в т. ч. сам), — уже следующего окна.
+        o = obs(now=NOW + datetime.timedelta(minutes=5),
+                runs=[run(9, "ci.yml", created="2026-10-12T10:49:00Z"), run(CANARY_RUN, "canary-trigger.yml")],
+                reviewer_logs={})
+        _, dline, _ = dl.build(o, 2)
+        self.assertIn(" runs=1 ", dline)
+
+    def test_previous_unreadable(self):
+        body, _, _ = dl.build(obs(previous_digest=dl.Missing("нет права actions:read (HTTP 403)")), 2)
+        self.assertIn("(предыдущая сводка не прочитана (нет права actions:read (HTTP 403)): окно 24 ч)", body)
+
+
 class Lines(unittest.TestCase):
     def test_retention_observed_expires_in(self):
         log = reviewer_log(retention="observed=84d")
@@ -203,17 +266,21 @@ class Lines(unittest.TestCase):
                                    "all": dl.Missing("x"), "allowed": dl.Missing("x")}}
         body, dline, incomplete = dl.build(obs(bypass=b), 1)
         self.assertIn("bypass_24h=probe:0/forbidden,factory-knowledge:1/allowed,online-base:not_observed ", dline)
-        self.assertIn("bypass_total=probe:0/forbidden,factory-knowledge:2/allowed,online-base:not_observed ", dline)
+        self.assertIn("bypass_30d=probe:0/forbidden,factory-knowledge:2/allowed,online-base:not_observed ", dline)
         text = line(body, "ОБХОДЫ")
         self.assertIn("probe: за сутки 0, за 30 дней 0; обход невозможен по настройке — ноль здесь ничего не доказывает", text)
         self.assertIn("online-base: не наблюдалось: нет права administration=read (HTTP 403)", text)
-        self.assertEqual(incomplete, ["ОБХОДЫ"])
+        self.assertEqual(incomplete, ["ОБХОДЫ (online-base)"])
+        self.assertTrue(body.endswith("СВОДКА НЕПОЛНАЯ: ОБХОДЫ (online-base)\n"))
+        self.assertIn(" complete=no:bypass(online-base)", dline)
 
     def test_bypass_flag_unknown_is_gap(self):
-        b = {r: {"day": [], "all": [], "allowed": dl.Missing("нет права")} for r in dl.BYPASS_REPOS}
+        # D-133 b: число есть, признак не прочитан → N/unknown, репозиторий — в перечне.
+        b = {r: {"day": [], "all": [], "allowed": True} for r in dl.BYPASS_REPOS}
+        b[dl.PROBE_REPO] = {"day": [{"id": 1}], "all": [{"id": 1}], "allowed": dl.Missing("нет права")}
         _, dline, incomplete = dl.build(obs(bypass=b), 1)
-        self.assertIn("bypass_24h=probe:0/unknown,", dline)
-        self.assertEqual(incomplete, ["ОБХОДЫ"])
+        self.assertIn("bypass_24h=probe:1/unknown,factory-knowledge:0/allowed,", dline)
+        self.assertEqual(incomplete, ["ОБХОДЫ (probe)"])
 
     def test_prless_branch(self):
         prs = [{"number": 40, "head": {"ref": "agent/x", "repo": {"full_name": dl.PROBE_REPO}}},
@@ -228,6 +295,15 @@ class Lines(unittest.TestCase):
         self.assertIn("worklog_age=10 ", dline)
         self.assertIn("standards_age=not_observed ", dline)
 
+    def test_checks_changed_per_repo(self):
+        c = {r: [] for r in dl.CHECKS_REPOS}
+        c[dl.PROBE_REPO] = [{"sha": "f1be53b" + "0" * 33, "date": "x"}, {"sha": "d4ee0ef" + "0" * 33, "date": "y"}]
+        c[dl.ONLINE_BASE_REPO] = dl.Missing("нет права contents:read на online-base: ресурс не виден токену (HTTP 404)")
+        body, dline, incomplete = dl.build(obs(checks=c), 1)
+        self.assertIn("checks_changed=probe:2,factory-ci:0,factory-knowledge:0,online-base:not_observed,cost-panel:0 ", dline)
+        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 2 (f1be53b, d4ee0ef); factory-ci: 0;", body)
+        self.assertEqual(incomplete, ["ИЗМЕНЕНИЕ ПРОВЕРОК (online-base)"])
+
     def test_values_have_no_spaces(self):
         log = reviewer_log(result="UNKNOWN(review_job_failure)")
         _, dline, _ = dl.build(obs(reviewer_logs={REVIEWER_RUN: log}), "n/a")
@@ -241,6 +317,9 @@ class Flow(unittest.TestCase):
         self.posted, self.calls = [], []
         self.post_status = 201
         self.runs = []
+        self.digests = []
+        self.checks_queries = []
+        self.github_commits = {F.REPO: [{"sha": "f1be53b" + "0" * 33, "commit": {"committer": {"date": "2026-10-12T09:00:00Z"}}}]}
         self.env = {"GH_TOKEN_READ": "r", "GH_TOKEN_KNOWLEDGE": "k", "GH_TOKEN_DIGEST": "d",
                     "GITHUB_RUN_ID": str(OWN_RUN), "GITHUB_RUN_NUMBER": "3"}
 
@@ -253,8 +332,21 @@ class Flow(unittest.TestCase):
         if method == "POST" and p == f"/repos/{F.KR}/issues/{dl.DIGEST_ISSUE}/comments":
             self.posted.append((token, json.loads(body)["body"]))
             return self.post_status, {}, b"{}"
+        if p == f"/repos/{F.REPO}/actions/runs/{OWN_RUN}":
+            return ok({"id": OWN_RUN, "created_at": "2026-10-12T10:47:00Z"})
+        if p == f"/repos/{F.REPO}/actions/workflows/digest.yml/runs":
+            return ok({"workflow_runs": self.digests})
         if p == f"/repos/{F.REPO}/actions/runs":
             return ok({"workflow_runs": self.runs if "page=1" in path else []})
+        if p.endswith("/commits") and "path=.github" in path:
+            repo = p[len("/repos/"):-len("/commits")]
+            if repo in ("Online-Base1/online-base", "Online-Base1/cost-panel"):
+                return 404, {}, b"{}"
+            if repo == F.KR and token != "Bearer k":
+                return 404, {}, b"{}"
+            self.checks_queries.append(path)
+            commits = self.github_commits.get(repo, [])
+            return ok(commits if "page=1" in path else [])
         if p == f"/repos/{F.REPO}/actions/workflows/reviewer.yml/runs":
             return ok({"total_count": 0, "workflow_runs": []})
         if p == f"/repos/{F.REPO}/pulls":
@@ -274,7 +366,7 @@ class Flow(unittest.TestCase):
         token, posted = self.posted[0]
         self.assertEqual(token, "Bearer d")  # публикует только токен issues:write
         self.assertEqual(posted, body)
-        self.assertIn("РЕВЬЮЕР: не наблюдалось: ночного прогона не было", posted)
+        self.assertIn("РЕВЬЮЕР: не наблюдалось: прогона по расписанию не было", posted)
         self.assertIn("probe: не наблюдалось: нет права administration=read (HTTP 403)", posted)
         self.assertIn("ЖУРНАЛ: не наблюдалось: нет права contents:read на online-base: ресурс не виден токену (HTTP 404)",
                       posted)
@@ -283,7 +375,11 @@ class Flow(unittest.TestCase):
         # Никаких записей, кроме одного комментария; токен публикации ничего не читает.
         self.assertEqual([c for c in self.calls if c[0] != "GET"], [("POST", self.calls[-1][1], "Bearer d")])
         self.assertEqual([c for c in self.calls if c[2] == "Bearer d" and c[0] == "GET"], [])
-        self.assertFalse([c for c in self.calls if c[0] == "GET" and c[2] == "" ])
+        self.assertFalse([c for c in self.calls if c[0] == "GET" and c[2] == ""])
+        self.assertNotIn("HTTP 599", posted)  # каждый запрос сводки знаком подделке
+        self.assertIn("ИЗМЕНЕНИЕ ПРОВЕРОК: коммитов в .github/ на main — probe: 1 (f1be53b); factory-ci: 0; "
+                      "factory-knowledge: 0; online-base: не наблюдалось: нет права contents:read на online-base", posted)
+        self.assertIn("(первая сводка: окно 24 ч)", posted)
 
     def test_knowledge_token_missing_still_published(self):
         del self.env["GH_TOKEN_KNOWLEDGE"]
@@ -308,6 +404,16 @@ class Flow(unittest.TestCase):
         self.assertIn("НОЧЬ: прогонов 0, красных 0", body)
         q = [c[1] for c in self.calls if "/actions/runs?" in c[1]][0]
         self.assertIn("created=%3E%3D2026-10-11T10%3A47%3A00Z", q)
+        self.assertTrue(all("since=2026-10-11T10%3A47%3A00Z&until=2026-10-12T10%3A47%3A00Z" in x
+                            for x in self.checks_queries))
+
+    def test_window_from_previous_digest(self):
+        self.digests = [{"id": OWN_RUN, "created_at": "2026-10-12T10:47:00Z"},
+                        {"id": 38280526382, "created_at": "2026-10-11T16:53:28Z"}]
+        body, _ = dg.run(self.env, self.transport, now=NOW)
+        self.assertIn("окно 2026-10-11T16:53Z … 2026-10-12T10:47Z (от предыдущей сводки 38280526382)", body)
+        q = [c[1] for c in self.calls if "/actions/runs?" in c[1]][0]
+        self.assertIn("created=%3E%3D2026-10-11T16%3A53%3A28Z", q)
 
 
 if __name__ == "__main__":
