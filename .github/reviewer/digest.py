@@ -189,7 +189,26 @@ def bypass_of(gh, repo):
     return {"day": day, "all": total, "allowed": allowed}
 
 
-def collect(gh_read, gh_knowledge, now, own_run_id):
+def job_names(gh, repo, run_id):
+    """Имена заданий прогона ревьюера: есть ли в нём job контрольной (refusal-probes)."""
+    jobs = get_pages(gh, f"/repos/{repo}/actions/runs/{run_id}/jobs", "actions:read на probe", key="jobs")
+    return jobs if isinstance(jobs, dl.Missing) else [j.get("name") for j in jobs]
+
+
+def env_check(path):
+    """Результат шага Environment check этого прогона (env_check.py runtime) или Missing."""
+    if not path:
+        return dl.Missing("ENV_CHECK_FILE не задан: шаг сверки среды не подключён")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return dl.Missing("сверка среды не создала результата: шаг Environment check не выполнился")
+    except ValueError:
+        return dl.Missing("результат сверки среды не JSON")
+
+
+def collect(gh_read, gh_knowledge, now, own_run_id, env_file=""):
     """Все источники сводки; каждый — данные либо Missing."""
     probe = dl.PROBE_REPO
     created = own_created(gh_read, probe, own_run_id)
@@ -243,6 +262,8 @@ def collect(gh_read, gh_knowledge, now, own_run_id):
         "standards_last": last_commit_date(gh_knowledge, rl.KNOWLEDGE_REPO, dl.STANDARDS_PATH,
                                            "contents:read на factory-knowledge"),
         "merges": merges,
+        "reviewer_jobs": {rid: job_names(gh_read, probe, rid) for rid in reviewer_logs},
+        "env_check": env_check(env_file),
         "checks": {repo: commit_files(tokens[repo], repo, merges[repo]) for repo in dl.CHECKS_REPOS},
     }
 
@@ -261,7 +282,7 @@ def run(env, transport=rv.http_transport, now=None):
 
     now = now or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
     gh_read = gh("GH_TOKEN_READ") or rv.GitHub("", transport)
-    obs = collect(gh_read, gh("GH_TOKEN_KNOWLEDGE"), now, env.get("GITHUB_RUN_ID", ""))
+    obs = collect(gh_read, gh("GH_TOKEN_KNOWLEDGE"), now, env.get("GITHUB_RUN_ID", ""), env.get("ENV_CHECK_FILE", ""))
     body, dline, incomplete = dl.build(obs, env.get("GITHUB_RUN_NUMBER", "") or "n/a")
     print(body)
     gh_digest = gh("GH_TOKEN_DIGEST")
@@ -273,6 +294,10 @@ def run(env, transport=rv.http_transport, now=None):
         print(f"::error::digest not published: POST {rl.KNOWLEDGE_REPO}#{dl.DIGEST_ISSUE} comment -> HTTP {status}")
         return body, 1
     print(f"digest published: {rl.KNOWLEDGE_REPO}#{dl.DIGEST_ISSUE} -> HTTP {status}; incomplete: {incomplete or 'none'}")
+    if " control=blind:" in dline:
+        # Сводка опубликована, но её механика извлечения отказов слепа (D-143 §f).
+        print("::error::positive control: no refusal probe found in any reviewer run in the window — extraction is blind")
+        return body, 1
     return body, 0
 
 

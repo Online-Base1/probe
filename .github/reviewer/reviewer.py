@@ -148,6 +148,7 @@ def write_probes(gh_knowledge, gh_probe):
     status, _, data = gh_knowledge.request(
         "POST", f"/repos/{rl.KNOWLEDGE_REPO}/issues/{rl.WRITE_PROBE_ISSUE}/comments",
         {"body": "reviewer write probe — this request must be refused (D-103 §e)"})
+    print(rl.refusal_line("p1_knowledge_comment", status))
     if 200 <= status < 300:
         # Запись прошла — убрать след и остаться красным.
         try:
@@ -161,6 +162,7 @@ def write_probes(gh_knowledge, gh_probe):
     status, _, _ = gh_probe.request(
         "POST", f"/repos/{os.environ.get('REPO', 'Online-Base1/probe')}/pulls/{rl.CANARY_PR}/reviews",
         {"event": "APPROVE", "body": "reviewer approve probe — this request must be refused (D-103 §e)"})
+    print(rl.refusal_line("p2_canary_approve", status))
     rl.judge_write_probe("p2_canary_approve", status)
     print(f"(п2) APPROVE on canary PR #{rl.CANARY_PR} with the probe token -> {status} (refused, as required)")
 
@@ -403,12 +405,21 @@ def main(argv):
                       "prompt_sha": st["prompt_sha"], "format_sha": st["format_sha"],
                       "model": st["model"], "canary": st["canary"]})
         return 0
+    if cmd == "probes":
+        # Job refusal-probes: пробы отказа в КАЖДОМ прогоне, независимо от resolve —
+        # положительная контрольная сводки (§18′ п.18, D-143 §f).
+        try:
+            write_probes(GitHub(os.environ.get("GH_TOKEN_KNOWLEDGE", "")), GitHub(os.environ.get("GH_TOKEN_PROBE", "")))
+        except rl.Unknown as exc:
+            print(f"::error::refusal probes: UNKNOWN({exc.reason})")
+            return 1
+        return 0
     if cmd == "report":
         lines, code = report(os.environ, gh=GitHub(os.environ.get("GH_TOKEN_READ", "")))
         print("\n".join(lines))
         _summary(lines)
         return code
-    print("usage: reviewer.py resolve|review|report", file=sys.stderr)
+    print("usage: reviewer.py resolve|review|probes|report", file=sys.stderr)
     return 2
 
 

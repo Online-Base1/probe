@@ -240,6 +240,17 @@ def already_reviewed(comments, head_sha, canary_run_id=None):
                for c in comments)
 
 
+# Положительная контрольная механики извлечения отказов (§18′ п.18, D-143 §f):
+# каждая проба на запись печатает эту строку ДО вердикта — и отказ, и (дефект)
+# разрешение видны в журнале одинаково; сводка ищет её по метке.
+REFUSAL_MARKER = "REFUSAL_PROBE"
+
+
+def refusal_line(name, status):
+    result = "refused" if status == 403 else "allowed" if 200 <= status < 300 else "unexpected"
+    return f"{REFUSAL_MARKER} name={name} status={status} result={result}"
+
+
 def judge_write_probe(name, status):
     """Проба на запись обязана получить 403; 2xx — красный; иное — UNKNOWN."""
     if status == 403:
