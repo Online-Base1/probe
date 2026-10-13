@@ -712,6 +712,17 @@ class Outcomes(unittest.TestCase):
         self.assertIn(f"UNKNOWN(вердикт не сработал) 1 ({REVIEWER_RUN})", text)
         self.assertIn("noverdict=1", field)
 
+    def test_case3_reviewer_unknown_result_is_no_verdict(self):
+        # D-144 §b: format_missing, comment_post:403 — строка есть, вердикта нет.
+        for result in ("UNKNOWN(format_missing)", "UNKNOWN(comment_post:403)"):
+            with self.subTest(result=result):
+                text, field = self.assertNotSuccess(obs(reviewer_logs={REVIEWER_RUN: reviewer_log(result=result)}))
+                self.assertIn(f"UNKNOWN(вердикт не сработал) 1 ({REVIEWER_RUN})", text)
+
+    def test_reviewer_incomplete_agent_run_is_a_verdict(self):
+        log = reviewer_log(result="AGENT_RUN_INCOMPLETE(cancelled)")
+        self.assertSuccessLooking(obs(reviewer_logs={REVIEWER_RUN: log}))
+
     def test_case3_run_without_verdict_gates(self):
         jobs = {601: [{"name": "gates / preflight", "conclusion": "failure"}, {"name": "gates / verdict", "conclusion": "skipped"}]}
         text, field = self.assertNotSuccess(obs(runs=obs()["runs"] + [ci_run(601)], ci_jobs=jobs))

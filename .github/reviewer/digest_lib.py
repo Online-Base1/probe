@@ -621,14 +621,18 @@ def deadline_of(config):
 def verdict_fired(run, reviewer_logs, ci_jobs):
     """Сработал ли вердикт завершённого прогона → True | False | Missing.
 
-    Ревьюер — строка REVIEW_LEDGER в журнале (D-145 §c.3); ci.yml — job
-    «gates / verdict» с исходом success/failure; прочие потоки вердиктом
-    считают сам conclusion прогона.
+    Ревьюер — строка REVIEW_LEDGER в журнале с исходом не UNKNOWN(...): прогон
+    с result=UNKNOWN(format_missing) и т.п. вердикта не дал (D-144 §b, D-145
+    §c.3); ci.yml — job «gates / verdict» с исходом success/failure; прочие
+    потоки вердиктом считают сам conclusion прогона.
     """
     wf = workflow_file(run)
     if wf == REVIEWER_WORKFLOW_PATH:
         log = reviewer_logs.get(run["id"], Missing("журнал ревьюера не запрошен"))
-        return log if isinstance(log, Missing) else ledger_of(log) is not None
+        if isinstance(log, Missing):
+            return log
+        ledger = ledger_of(log)
+        return ledger is not None and not ledger.get("result", rl.UNKNOWN_KIND).startswith(rl.UNKNOWN_KIND)
     if wf == CI_WORKFLOW_PATH:
         jobs = ci_jobs.get(run["id"], Missing("задания гейтов не запрошены"))
         if isinstance(jobs, Missing):
