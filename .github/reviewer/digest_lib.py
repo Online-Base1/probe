@@ -20,6 +20,9 @@
 СРЕДА — сверка среды прогона сводки с environment.lock.json (§18′ п.18, D-143);
 КОНТРОЛЬНАЯ — заведомые пробы-отказы в каждом прогоне ревьюера за окно: не
 найдены ни в одном — механика извлечения слепа, прогон сводки красный (D-143 §f).
+ИСХОДЫ — исход каждого прогона окна (§18′ п.17, D-145): не завершён за срок из
+digest-config.json и завершён без вердикта — UNKNOWN, идущий в срок — «идёт»;
+источника запросов нет — так и сказано, без нуля (D-139).
 
 Всё, что приходит из сети, передаётся сюда уже полученным (digest.py); то,
 что получить не удалось, приходит как Missing(причина). Так каждая строка
@@ -78,6 +81,7 @@ LINES = (
     ("checks", "ИЗМЕНЕНИЕ ПРОВЕРОК"),
     ("env", "СРЕДА"),
     ("control", "КОНТРОЛЬНАЯ"),
+    ("outcomes", "ИСХОДЫ"),
 )
 FIELDS_OF = {
     "night": ("runs", "red", "unknown"),
@@ -93,10 +97,11 @@ FIELDS_OF = {
     "merges": ("merges",),
     "env": ("env",),
     "control": ("control",),
+    "outcomes": ("outcomes",),
 }
 DIGEST_FIELDS = ("seq", "date", "runs", "red", "unknown", "reviewer", "findings", "canary", "retention",
                  "expires_in", "bypass_24h", "bypass_30d", "prless_branch", "worklog_age", "models",
-                 "standards_age", "checks_changed", "complete", "merges", "env", "control")
+                 "standards_age", "checks_changed", "complete", "merges", "env", "control", "outcomes")
 
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required", "cancelled", "stale"}
 MODEL_CHECKS = ("в", "г", "д")
@@ -544,6 +549,9 @@ def line_control(obs):
     сводки красный (иначе её устойчивый ноль неотличим от отсутствия событий,
     D-139). Проба, НЕ получившая отказ, — КРАСНЫЙ в строке."""
     logs, jobs = obs["reviewer_logs"], obs["reviewer_jobs"]
+    # Пустой словарь журналов при непрочитанном списке прогонов — «не вычислено»,
+    # а не «прогонов не было» (§18′ п.17, D-145 §d).
+    need(obs["runs"])
     if not logs:
         raise NotObserved("прогонов ревьюера за окно не было — контрольной нечего показать")
     found, missing, before, unread, allowed = [], [], [], [], []
@@ -581,10 +589,174 @@ def line_control(obs):
         {"control": f"ok:{len(found)}/{considered}"}, []
 
 
+# --- ИСХОДЫ (§18′ п.17, D-145): UNKNOWN выглядит как UNKNOWN ---
+
+CONFIG_NAME = ".github/reviewer/digest-config.json"
+REVIEWER_WORKFLOW_PATH = ".github/workflows/" + rl.REVIEWER_WORKFLOW_FILE
+DEADLINE_FIELD = "run_deadline_minutes"
+CI_WORKFLOW_PATH = ".github/workflows/ci.yml"
+# Вердикт гейтов — job verdict вызова gates.yml; сработал — дал success или failure.
+CI_VERDICT_JOB = "gates / verdict"
+VERDICT_FIRED = {"success", "failure"}
+# Незавершённые прогоны читаются и вне окна: прогон, начатый до окна и не
+# закончившийся, иначе пропал бы из отчёта, не став UNKNOWN.
+UNFINISHED_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
+OUTCOME_STATES = ("done", "running", "timeout", "noverdict", "unread")
+
+
+def deadline_of(config):
+    """Срок завершения прогона в минутах из digest-config.json (D-145 §e) или NotObserved."""
+    if isinstance(config, Missing):
+        raise NotObserved(f"срок не задан: {config.reason}")
+    if not isinstance(config, dict):
+        raise NotObserved(f"срок не задан: {CONFIG_NAME} — не объект")
+    if DEADLINE_FIELD not in config:
+        raise NotObserved(f"срок не задан: в {CONFIG_NAME} нет поля {DEADLINE_FIELD}")
+    value = config[DEADLINE_FIELD]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise NotObserved(f"срок не задан: {DEADLINE_FIELD}={value!r} — не положительное число")
+    return value
+
+
+def verdict_fired(run, reviewer_logs, ci_jobs):
+    """Сработал ли вердикт завершённого прогона → True | False | Missing.
+
+    Ревьюер — строка REVIEW_LEDGER в журнале (D-145 §c.3); ci.yml — job
+    «gates / verdict» с исходом success/failure; прочие потоки вердиктом
+    считают сам conclusion прогона.
+    """
+    wf = workflow_file(run)
+    if wf == REVIEWER_WORKFLOW_PATH:
+        log = reviewer_logs.get(run["id"], Missing("журнал ревьюера не запрошен"))
+        return log if isinstance(log, Missing) else ledger_of(log) is not None
+    if wf == CI_WORKFLOW_PATH:
+        jobs = ci_jobs.get(run["id"], Missing("задания гейтов не запрошены"))
+        if isinstance(jobs, Missing):
+            return jobs
+        return any(j.get("name") == CI_VERDICT_JOB and j.get("conclusion") in VERDICT_FIRED for j in jobs)
+    return run.get("conclusion") is not None
+
+
+def classify_run(run, now, deadline, no_deadline, reviewer_logs, ci_jobs):
+    """Ровно одно состояние прогона → (состояние, причина).
+
+    done — завершён и исход есть; running — не завершён, срок не истёк (это не
+    UNKNOWN); timeout — не завершён, срок истёк (прошло не меньше срока: на
+    границе срок уже истёк); noverdict — завершён, вердикт не сработал;
+    unread — состояние не вычислено (нет срока, журнал или задания не прочитаны).
+    """
+    if run.get("status") != "completed":
+        if deadline is None:
+            return "unread", no_deadline
+        started = parse_time(run.get("run_started_at") or run["created_at"])
+        if now - started >= datetime.timedelta(minutes=deadline):
+            return "timeout", ""
+        return "running", ""
+    fired = verdict_fired(run, reviewer_logs, ci_jobs)
+    if isinstance(fired, Missing):
+        return "unread", fired.reason
+    return ("done", "") if fired else ("noverdict", "")
+
+
+def match_requests(requests, request_runs, now, deadline):
+    """Сверка «запрос → прогон» (§18′ п.17, случай 1) → None | dict.
+
+    requests — записи источника запросов: {id, requested_at, run_id|None};
+    None — источника нет (пульта нет, п.3): тогда и ответа нет, не ноль
+    (D-139). request_runs — {run_id: прогон | None (нет такого) | Missing}.
+    Запрос без run_id сопоставить нельзя: площадка отдаёт идентификатор на
+    workflow_dispatch только по return_run_details, и источник обязан его хранить.
+    """
+    if requests is None:
+        return None
+    if isinstance(requests, Missing):
+        raise NotObserved(f"источник запросов не прочитан: {requests.reason}")
+    out = {"matched": [], "waiting": [], "lost": [], "noref": [], "unread": []}
+    for q in requests:
+        ref = q.get("run_id")
+        if ref is None:
+            out["noref"].append(str(q["id"]))
+            continue
+        found = request_runs.get(str(ref), Missing("прогон запроса не запрошен"))
+        if isinstance(found, Missing):
+            out["unread"].append(f"{q['id']}: {found.reason}")
+        elif found is not None:
+            out["matched"].append(str(q["id"]))
+        elif deadline is None:
+            out["unread"].append(f"{q['id']}: срок не задан")
+        elif now - parse_time(q["requested_at"]) >= datetime.timedelta(minutes=deadline):
+            out["lost"].append(str(q["id"]))
+        else:
+            out["waiting"].append(str(q["id"]))
+    return out
+
+
+def ids(items):
+    return f" ({', '.join(items)})" if items else ""
+
+
+def line_outcomes(obs):
+    """Исход каждого прогона окна (D-145 §c–§e). Вычисляется всегда: ни от ночи,
+    ни от ревьюера не зависит (D-144 §a). Источника запросов нет — так и
+    печатается, без «0 потерянных» (D-139, D-145 §d)."""
+    start, end, _ = window_of(obs)
+    runs = need(obs["runs"])
+    pool = {str(r["id"]): r for r in in_window(runs, start, end)}
+    gaps = []
+    unfinished = obs["unfinished_runs"]
+    if isinstance(unfinished, Missing):
+        gaps.append(f"незавершённые прогоны до окна не прочитаны: {unfinished.reason}")
+    else:
+        for r in unfinished:
+            pool.setdefault(str(r["id"]), r)
+    pool.pop(str(obs["own_run_id"]), None)
+    try:
+        deadline, no_deadline = deadline_of(obs["digest_config"]), ""
+    except NotObserved as exc:
+        deadline, no_deadline = None, exc.reason
+        gaps.append(no_deadline)
+    buckets = {s: [] for s in OUTCOME_STATES}
+    for rid in sorted(pool):
+        state, reason = classify_run(pool[rid], obs["now"], deadline, no_deadline,
+                                     obs["reviewer_logs"], obs["ci_jobs"])
+        buckets[state].append(f"{rid}: {reason}" if reason else rid)
+    if buckets["unread"]:
+        gaps.append("не вычислено: " + "; ".join(buckets["unread"]))
+    req = match_requests(obs["requests"], obs["request_runs"], obs["now"], deadline)
+    if req is None:
+        req_text, req_field = ("запросы: источника нет — пульта нет (§18′ п.3), сверка запрос→прогон "
+                               "не выполнялась"), "no_source"
+    else:
+        req_text = (f"запросы: сопоставлено {len(req['matched'])}, ожидают {len(req['waiting'])}, "
+                    + (f"UNKNOWN(запрос без прогона) {len(req['lost'])}{ids(req['lost'])}" if req["lost"]
+                       else "без прогона 0") + ", "
+                    + (f"UNKNOWN(запрос без run_ref) {len(req['noref'])}{ids(req['noref'])}" if req["noref"]
+                       else "без run_ref 0"))
+        if req["unread"]:
+            req_text += ", не вычислено " + "; ".join(req["unread"])
+            gaps.append("запросы не вычислены: " + "; ".join(req["unread"]))
+        req_field = "/".join(f"{k}={len(req[k])}" for k in ("matched", "waiting", "lost", "noref", "unread"))
+    due = f"срок {deadline:g} мин ({CONFIG_NAME})" if deadline is not None else no_deadline
+    b = buckets
+    # Слово UNKNOWN — только при ненулевом счёте: ноль печатается словами,
+    # иначе благополучная ночь выглядела бы как тревога, и наоборот (D-145 §b).
+    def unknown(_, items, label, zero):
+        return f"UNKNOWN({label}) {len(items)}{ids(items)}" if items else zero
+    text = (f"завершено с исходом {len(b['done'])}; идёт {len(b['running'])}{ids(b['running'])}; "
+            + unknown(0, b["timeout"], "не завершён за срок", "не завершённых за срок 0") + "; "
+            + unknown(0, b["noverdict"], "вердикт не сработал", "без вердикта 0")
+            + (f"; не вычислено {len(b['unread'])}{ids(b['unread'])}" if b["unread"] else "")
+            + f"; {due}; {req_text}")
+    unknown = b["timeout"] or b["noverdict"] or (req is not None and (req["lost"] or req["noref"]))
+    state = "UNKNOWN" if unknown else NOT_OBSERVED if gaps else "ok"
+    field = (f"{state}:" + ",".join(f"{s}={len(b[s])}" for s in OUTCOME_STATES) + f",requests={req_field}")
+    return text, {"outcomes": field}, gaps
+
+
 LINE_FUNCS = {"night": line_night, "reviewer": line_reviewer, "canary": line_canary, "retention": line_retention,
               "bypass": line_bypass, "prless": line_prless, "worklog": line_worklog, "models": line_models,
               "standards": line_standards, "checks": line_checks, "merges": line_merges,
-              "env": line_env, "control": line_control}
+              "env": line_env, "control": line_control, "outcomes": line_outcomes}
 
 
 def compute_line(key, obs):

@@ -114,6 +114,11 @@ def obs(**over):
         "standards_last": "2026-10-10T08:00:00Z",
         "checks": {r: {} for r in dl.CHECKS_REPOS},
         "merges": {r: merges_src() for r in dl.MERGES_REPOS},
+        "digest_config": {"run_deadline_minutes": 30},
+        "unfinished_runs": [],
+        "ci_jobs": {},
+        "requests": None,
+        "request_runs": {},
     }
     o.update(over)
     return o
@@ -159,7 +164,8 @@ class Shape(unittest.TestCase):
                                 "checks_changed=probe:0,factory-ci:0,factory-knowledge:0,online-base:0,cost-panel:0 "
                                 "complete=yes "
                                 "merges=probe:0/0/0,factory-ci:0/0/0,factory-knowledge:0/0/0,online-base:0/0/0,cost-panel:0/0/0 "
-                                "env=match@20261004.327.1 control=ok:1/1")
+                                "env=match@20261004.327.1 control=ok:1/1 "
+                                "outcomes=ok:done=2,running=0,timeout=0,noverdict=0,unread=0,requests=no_source")
         self.assertIn("(первая сводка: окно 24 ч)", body)
         self.assertIn("окно 2026-10-11T10:47Z … 2026-10-12T10:47Z", body)
 
@@ -200,7 +206,7 @@ class Shape(unittest.TestCase):
         self.assertEqual(incomplete, [
             "НОЧЬ", "РЕВЬЮЕР", "КАНАРЕЙКА", "СРОК ХРАНЕНИЯ", "ОБХОДЫ (probe, factory-knowledge, online-base)",
             f"ВЛИВАНИЯ ({five})", "ЗАЯВКИ БЕЗ ВЕТКИ", "ЖУРНАЛ", "МОДЕЛИ", "ПРАВИЛА", f"ИЗМЕНЕНИЕ ПРОВЕРОК ({five})",
-            "СРЕДА", "КОНТРОЛЬНАЯ"])
+            "СРЕДА", "КОНТРОЛЬНАЯ", "ИСХОДЫ"])
         self.assertTrue(all("не наблюдалось" in h for h in lines_of(body)[:len(TITLES)]))
         self.assertIn("complete=no:night,reviewer,canary,retention,bypass(probe+factory-knowledge+online-base),", dline)
 
@@ -466,7 +472,7 @@ class ControlLine(unittest.TestCase):
         body, dline, incomplete = self.build({3: reviewer_log(upstream=111, trigger="agent"), REVIEWER_RUN: reviewer_log()})
         self.assertEqual(line(body, "КОНТРОЛЬНАЯ"),
                          f"КОНТРОЛЬНАЯ: проба-отказ найдена во всех 2 прогонах ревьюера (3, {REVIEWER_RUN})")
-        self.assertTrue(dline.endswith(" control=ok:2/2"))
+        self.assertIn(" control=ok:2/2 ", dline)
         self.assertEqual(incomplete, [])
 
     def test_found_in_none_is_blind_red(self):
@@ -474,13 +480,13 @@ class ControlLine(unittest.TestCase):
         self.assertEqual(line(body, "КОНТРОЛЬНАЯ"),
                          f"КОНТРОЛЬНАЯ: КРАСНЫЙ: механика извлечения отказов слепа — заведомая проба-отказ не найдена "
                          f"ни в одном из 1 прогонов ревьюера ({REVIEWER_RUN})")
-        self.assertTrue(dline.endswith(" control=blind:0/1"))
+        self.assertIn(" control=blind:0/1 ", dline)
         self.assertEqual(incomplete, [])  # наблюдено и красное — не пробел
 
     def test_partial_is_gap(self):
         body, dline, incomplete = self.build({3: reviewer_log(probes=False), REVIEWER_RUN: reviewer_log()})
         self.assertIn("проба-отказ найдена в 1 из 2 прогонов ревьюера; не найдена: 3", line(body, "КОНТРОЛЬНАЯ"))
-        self.assertTrue(dline.endswith(" control=partial:1/2"))
+        self.assertIn(" control=partial:1/2 ", dline)
         self.assertEqual(incomplete, ["КОНТРОЛЬНАЯ"])
 
     def test_runs_before_control_job_are_not_blindness(self):
@@ -488,7 +494,7 @@ class ControlLine(unittest.TestCase):
                                              {REVIEWER_RUN: ["resolve", "review", "report"]})
         self.assertEqual(line(body, "КОНТРОЛЬНАЯ"), "КОНТРОЛЬНАЯ: не наблюдалось: контрольная не проверялась ни в одном "
                                                     f"прогоне; до введения контрольной (нет job refusal-probes): {REVIEWER_RUN}")
-        self.assertTrue(dline.endswith(" control=not_observed"))
+        self.assertIn(" control=not_observed ", dline)
         self.assertEqual(incomplete, ["КОНТРОЛЬНАЯ"])
 
     def test_probe_not_refused_is_red(self):
@@ -647,6 +653,245 @@ class Lines(unittest.TestCase):
         self.assertEqual(len(dline.split(" ")), len(dl.DIGEST_FIELDS) + 1)
 
 
+def looks_like_success(text, field):
+    """Единый машинный критерий §18′ п.17 (D-145 §b): выход выглядит успехом, если
+    в строке нет ни UNKNOWN, ни причины словами, ИЛИ поле DIGEST читается как
+    благополучие (префикс ok: либо голое число)."""
+    has_reason = any(w in text for w in ("UNKNOWN", "не наблюдалось", "не вычислено"))
+    reads_fine = field.startswith("ok:") or re.fullmatch(r"\d+", field) is not None
+    return (not has_reason) or reads_fine
+
+
+def outcomes_of(o):
+    body, dline, incomplete = dl.build(o, 1)
+    return line(body, "ИСХОДЫ"), dict(kv.split("=", 1) for kv in dline.split(" ")[1:])["outcomes"], incomplete
+
+
+def minutes_ago(m, base=NOW):
+    return (base - datetime.timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def started_run(id_, wf, minutes, status="in_progress"):
+    r = run(id_, wf, conclusion=None, event="push", status=status, created=minutes_ago(minutes + 1))
+    r["run_started_at"] = minutes_ago(minutes)
+    return r
+
+
+def ci_run(id_, created="2026-10-12T10:10:00Z"):
+    return run(id_, "ci.yml", event="pull_request", created=created)
+
+
+VERDICT_JOBS = [{"name": "gates / preflight", "conclusion": "success"}, {"name": "gates / verdict", "conclusion": "success"}]
+
+
+class Outcomes(unittest.TestCase):
+    """§18′ п.17: три случая доказываются подачей состояния (D-145 §b), и обратные — нормальный вид."""
+
+    def assertNotSuccess(self, o):
+        text, field, _ = outcomes_of(o)
+        self.assertFalse(looks_like_success(text, field), (text, field))
+        return text, field
+
+    def assertSuccessLooking(self, o):
+        text, field, _ = outcomes_of(o)
+        self.assertTrue(looks_like_success(text, field), (text, field))
+        self.assertTrue(field.startswith("ok:"), field)
+        return text, field
+
+    # --- три случая ---
+
+    def test_case2_run_without_outcome_past_deadline(self):
+        stuck = started_run(501, "ci.yml", 45)
+        text, field = self.assertNotSuccess(obs(runs=obs()["runs"] + [stuck]))
+        self.assertIn("UNKNOWN(не завершён за срок) 1 (501)", text)
+        self.assertTrue(field.startswith("UNKNOWN:") and "timeout=1" in field, field)
+
+    def test_case3_run_without_verdict_reviewer(self):
+        log = reviewer_log().split("REVIEW_LEDGER")[0]  # журнал есть, вердикта нет
+        text, field = self.assertNotSuccess(obs(reviewer_logs={REVIEWER_RUN: log}))
+        self.assertIn(f"UNKNOWN(вердикт не сработал) 1 ({REVIEWER_RUN})", text)
+        self.assertIn("noverdict=1", field)
+
+    def test_case3_run_without_verdict_gates(self):
+        jobs = {601: [{"name": "gates / preflight", "conclusion": "failure"}, {"name": "gates / verdict", "conclusion": "skipped"}]}
+        text, field = self.assertNotSuccess(obs(runs=obs()["runs"] + [ci_run(601)], ci_jobs=jobs))
+        self.assertIn("UNKNOWN(вердикт не сработал) 1 (601)", text)
+
+    def test_case1_request_without_run(self):
+        req = [{"id": "q1", "requested_at": minutes_ago(40), "run_id": 999}]
+        text, field = self.assertNotSuccess(obs(requests=req, request_runs={"999": None}))
+        self.assertIn("UNKNOWN(запрос без прогона) 1 (q1)", text)
+        self.assertIn("requests=matched=0/waiting=0/lost=1/noref=0/unread=0", field)
+
+    def test_request_without_run_ref_is_unknown(self):
+        text, field = self.assertNotSuccess(obs(requests=[{"id": "q2", "requested_at": minutes_ago(1), "run_id": None}]))
+        self.assertIn("UNKNOWN(запрос без run_ref) 1 (q2)", text)
+
+    # --- обратные: нормальное состояние даёт нормальный вид ---
+
+    def test_normal_state_looks_normal(self):
+        text, field = self.assertSuccessLooking(obs())
+        self.assertIn("завершено с исходом 2; идёт 0; не завершённых за срок 0; без вердикта 0", text)
+
+    def test_running_within_deadline_is_not_unknown(self):
+        text, field = self.assertSuccessLooking(obs(runs=obs()["runs"] + [started_run(502, "ci.yml", 10)]))
+        self.assertIn("идёт 1 (502)", text)
+
+    def test_gates_verdict_fired_is_done(self):
+        self.assertSuccessLooking(obs(runs=obs()["runs"] + [ci_run(602)], ci_jobs={602: VERDICT_JOBS}))
+
+    def test_request_matched_and_waiting_look_normal(self):
+        req = [{"id": "q1", "requested_at": minutes_ago(40), "run_id": 11},
+               {"id": "q3", "requested_at": minutes_ago(5), "run_id": 12}]
+        text, field = self.assertSuccessLooking(obs(requests=req, request_runs={"11": {"id": 11}, "12": None}))
+        self.assertIn("запросы: сопоставлено 1, ожидают 1, без прогона 0, без run_ref 0", text)
+
+    def test_criterion_itself_rejects_bare_number_and_ok(self):
+        self.assertTrue(looks_like_success("UNKNOWN x", "ok:done=1"))
+        self.assertTrue(looks_like_success("UNKNOWN x", "0"))
+        self.assertTrue(looks_like_success("всё хорошо", "UNKNOWN:x"))
+        self.assertFalse(looks_like_success("UNKNOWN x", "UNKNOWN:timeout=1"))
+
+    # --- срок ---
+
+    def test_deadline_exactly_on_boundary_is_expired(self):
+        text, _, _ = outcomes_of(obs(runs=obs()["runs"] + [started_run(503, "ci.yml", 30)]))
+        self.assertIn("UNKNOWN(не завершён за срок) 1 (503)", text)
+        r = started_run(504, "ci.yml", 30)
+        r["run_started_at"] = (NOW - datetime.timedelta(minutes=30) + datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        text, _, _ = outcomes_of(obs(runs=obs()["runs"] + [r]))
+        self.assertIn("идёт 1 (504)", text)
+
+    def test_deadline_from_config_value(self):
+        text, _, _ = outcomes_of(obs(runs=obs()["runs"] + [started_run(505, "ci.yml", 45)],
+                                     digest_config={"run_deadline_minutes": 60}))
+        self.assertIn("идёт 1 (505)", text)
+        self.assertIn("срок 60 мин (.github/reviewer/digest-config.json)", text)
+
+    def test_started_at_missing_uses_created(self):
+        r = started_run(506, "ci.yml", 45)
+        del r["run_started_at"]
+        text, _, _ = outcomes_of(obs(runs=obs()["runs"] + [r]))
+        self.assertIn("UNKNOWN(не завершён за срок) 1 (506)", text)
+
+    def test_config_absent(self):
+        o = obs(runs=obs()["runs"] + [started_run(507, "ci.yml", 45)], digest_config=dl.Missing(".github/reviewer/digest-config.json отсутствует"))
+        text, field, incomplete = outcomes_of(o)
+        self.assertIn("срок не задан: .github/reviewer/digest-config.json отсутствует", text)
+        self.assertIn("не вычислено 1 (507: срок не задан", text)
+        self.assertTrue(field.startswith("not_observed:"), field)
+        self.assertIn("ИСХОДЫ", incomplete)
+        self.assertFalse(looks_like_success(text, field))
+
+    def test_config_absent_without_unfinished_is_still_gap(self):
+        text, field, incomplete = outcomes_of(obs(digest_config=dl.Missing("нет файла")))
+        self.assertIn("ИСХОДЫ", incomplete)
+        self.assertTrue(field.startswith("not_observed:"), field)
+
+    def test_config_field_absent(self):
+        text, field, _ = outcomes_of(obs(digest_config={"other": 1}))
+        self.assertIn("в .github/reviewer/digest-config.json нет поля run_deadline_minutes", text)
+        self.assertTrue(field.startswith("not_observed:"))
+
+    def test_config_value_not_a_number(self):
+        for bad in ("30", True, None, 0, -5, [30]):
+            with self.subTest(bad=bad):
+                text, field, incomplete = outcomes_of(obs(digest_config={"run_deadline_minutes": bad}))
+                self.assertIn("не положительное число", text)
+                self.assertIn("ИСХОДЫ", incomplete)
+
+    def test_config_not_object(self):
+        text, _, _ = outcomes_of(obs(digest_config=[30]))
+        self.assertIn("не объект", text)
+
+    def test_repo_config_is_valid_and_documents_its_source(self):
+        with open(dg.CONFIG_PATH, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        self.assertEqual(dl.deadline_of(cfg), 30)
+        src = cfg["run_deadline_source"]
+        self.assertEqual(max(src["observed_max_minutes"] * 2, 30), cfg["run_deadline_minutes"])
+
+    def test_digest_config_reader(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsInstance(dg.digest_config(os.path.join(d, "absent.json")), dl.Missing)
+            bad = os.path.join(d, "bad.json")
+            with open(bad, "w") as fh:
+                fh.write("{not json")
+            self.assertEqual(dg.digest_config(bad).reason, ".github/reviewer/digest-config.json — не JSON")
+
+    # --- различать «не вычислено» и «повода не было», вычисляется всегда ---
+
+    def test_no_request_source_is_named_not_zero(self):
+        text, field, _ = outcomes_of(obs())
+        self.assertIn("запросы: источника нет — пульта нет (§18′ п.3)", text)
+        self.assertNotIn("потерянных запросов 0", text)
+        self.assertNotRegex(text, r"запрос\w* 0")
+        self.assertTrue(field.endswith(",requests=no_source"), field)
+
+    def test_request_source_unreadable(self):
+        text, field, incomplete = outcomes_of(obs(requests=dl.Missing("журнал пульта: HTTP 500")))
+        self.assertIn("не наблюдалось: источник запросов не прочитан: журнал пульта: HTTP 500", text)
+        self.assertIn("ИСХОДЫ", incomplete)
+
+    def test_computed_without_nightly_run(self):
+        # D-144 §a: от ночи строка не зависит.
+        own = run(OWN_RUN, "digest.yml", status="in_progress", conclusion=None, created="2026-10-12T10:47:00Z")
+        text, field, _ = outcomes_of(obs(runs=[own, ci_run(603)], reviewer_logs={}, ci_jobs={603: VERDICT_JOBS}))
+        self.assertIn("завершено с исходом 1", text)
+        self.assertTrue(field.startswith("ok:"), field)
+
+    def test_own_run_is_not_counted(self):
+        text, _, _ = outcomes_of(obs())
+        self.assertNotIn(str(OWN_RUN), text)
+
+    def test_unfinished_before_window_included(self):
+        old = started_run(508, "agent.yml", 60 * 30)  # создан за 30 ч до сводки, окно — 24 ч
+        text, _, _ = outcomes_of(obs(unfinished_runs=[old]))
+        self.assertIn("UNKNOWN(не завершён за срок) 1 (508)", text)
+
+    def test_unfinished_runs_unreadable_is_gap(self):
+        text, field, incomplete = outcomes_of(obs(unfinished_runs=dl.Missing("HTTP 403")))
+        self.assertIn("ИСХОДЫ", incomplete)
+        self.assertTrue(field.startswith("not_observed:"), field)
+
+    def test_reviewer_log_unread_is_not_done(self):
+        text, field, _ = outcomes_of(obs(reviewer_logs={REVIEWER_RUN: dl.Missing("журнал прогона: HTTP 410")}))
+        self.assertIn(f"не вычислено 1 ({REVIEWER_RUN}: журнал прогона: HTTP 410)", text)
+        self.assertIn("done=1,", field)
+        self.assertTrue(field.startswith("not_observed:"))
+
+    def test_gates_jobs_unread_is_not_done(self):
+        text, _, _ = outcomes_of(obs(runs=obs()["runs"] + [ci_run(604)], ci_jobs={604: dl.Missing("HTTP 403")}))
+        self.assertIn("не вычислено 1 (604: HTTP 403)", text)
+
+    def test_gates_jobs_not_requested_is_not_done(self):
+        text, _, _ = outcomes_of(obs(runs=obs()["runs"] + [ci_run(605)]))
+        self.assertIn("не вычислено 1 (605: задания гейтов не запрошены)", text)
+
+    def test_runs_unreadable(self):
+        text, field, incomplete = outcomes_of(obs(runs=dl.Missing("HTTP 403 (actions:read)")))
+        self.assertEqual(text, "ИСХОДЫ: не наблюдалось: HTTP 403 (actions:read)")
+        self.assertEqual(field, "not_observed")
+
+    def test_each_run_exactly_one_state(self):
+        runs = obs()["runs"] + [started_run(511, "ci.yml", 45), started_run(512, "ci.yml", 5), ci_run(513)]
+        text, field, _ = outcomes_of(obs(runs=runs, ci_jobs={513: VERDICT_JOBS}))
+        counts = dict(kv.split("=") for kv in field.split(":", 1)[1].split(",")[:5])
+        self.assertEqual(sum(map(int, counts.values())), 5)  # canary, reviewer, 511, 512, 513 — без своего прогона
+        self.assertEqual(counts, {"done": "3", "running": "1", "timeout": "1", "noverdict": "0", "unread": "0"})
+
+    def test_outcomes_is_last_field_and_line(self):
+        body, dline, _ = dl.build(obs(), 1)
+        self.assertEqual(dl.DIGEST_FIELDS[-1], "outcomes")
+        self.assertEqual(digest_fields(dline)[-1], "outcomes")
+        self.assertEqual(dl.LINES[13], ("outcomes", "ИСХОДЫ"))
+        self.assertEqual(lines_of(body)[13].split(":")[0], "ИСХОДЫ")
+
+    def test_control_runs_unread_is_not_no_occasion(self):
+        body, _, _ = dl.build(obs(runs=dl.Missing("HTTP 403 (actions:read)"), reviewer_logs={}), 1)
+        self.assertEqual(line(body, "КОНТРОЛЬНАЯ"), "КОНТРОЛЬНАЯ: не наблюдалось: HTTP 403 (actions:read)")
+
+
 class Flow(unittest.TestCase):
     """digest.run с поддельным транспортом: что читается, куда публикуется."""
 
@@ -657,6 +902,8 @@ class Flow(unittest.TestCase):
         self.digests = []
         self.files_queries = []
         self.jobs = {}
+        self.unfinished = {}  # status → прогоны (запросы ?status=…, D-145)
+        self.status_queries = []
         self.commit_files = {"f" * 40: [".github/workflows/digest.yml"]}
         self.main_commits = {F.REPO: [{"sha": "f" * 40}]}
         self.tips = {F.REPO: "f" * 40}
@@ -681,6 +928,10 @@ class Flow(unittest.TestCase):
             return ok({"id": OWN_RUN, "created_at": "2026-10-12T10:47:00Z"})
         if p == f"/repos/{F.REPO}/actions/workflows/digest.yml/runs":
             return ok({"workflow_runs": self.digests})
+        if p == f"/repos/{F.REPO}/actions/runs" and "status=" in path:
+            status = re.search(r"status=(\w+)", path).group(1)
+            self.status_queries.append(status)
+            return ok({"workflow_runs": self.unfinished.get(status, []) if "page=1" in path else []})
         if p == f"/repos/{F.REPO}/actions/runs":
             return ok({"workflow_runs": self.runs if "page=1" in path else []})
         m_jobs = re.fullmatch(rf"/repos/{F.REPO}/actions/runs/(\d+)/jobs", p)
@@ -759,6 +1010,25 @@ class Flow(unittest.TestCase):
                       "cost-panel: не наблюдалось: репозиторий не виден токену (HTTP 404)", posted)
         self.assertEqual(self.compares, [])  # без запомненной вершины диапазона нет
         self.assertEqual(dl.heads_of(posted)["probe"], "f" * 40)
+
+    def test_outcomes_flow_unfinished_run_and_no_request_source(self):
+        stuck = started_run(777, "agent.yml", 60 * 30)  # начат за 30 ч, окно 24 ч — придёт только по статусу
+        self.unfinished = {"in_progress": [stuck]}
+        body, code = dg.run(self.env, self.transport, now=NOW)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(self.status_queries), sorted(dl.UNFINISHED_STATUSES))
+        out = line(body, "ИСХОДЫ")
+        self.assertIn("UNKNOWN(не завершён за срок) 1 (777)", out)
+        self.assertIn("срок 30 мин (.github/reviewer/digest-config.json)", out)  # из файла репозитория
+        self.assertIn("запросы: источника нет", out)
+        self.assertIn(" outcomes=UNKNOWN:done=0,running=0,timeout=1,noverdict=0,unread=0,requests=no_source", body)
+        self.assertNotIn("HTTP 599", body)
+
+    def test_outcomes_flow_gates_verdict_from_jobs(self):
+        self.runs = [ci_run(888)]
+        self.jobs = {888: ["gates / preflight", "gates / verdict"]}  # подделка отдаёт задания без conclusion
+        body, _ = dg.run(self.env, self.transport, now=NOW)
+        self.assertIn("UNKNOWN(вердикт не сработал) 1 (888)", line(body, "ИСХОДЫ"))
 
     def remember(self, heads):
         prev = 38291821501
