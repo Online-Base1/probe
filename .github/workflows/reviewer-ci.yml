@@ -32,6 +32,20 @@ jobs:
             .github/reviewer/
             .github/workflows/
           sparse-checkout-cone-mode: false
+      # Шаг 0 задания §18′ п.18: наблюдение среды. Временный, заменяется сверкой.
+      - name: Observe runner environment (step 0)
+        shell: bash
+        run: |
+          echo "ImageOS=${ImageOS:-<unset>}"
+          echo "ImageVersion=${ImageVersion:-<unset>}"
+          echo "RUNNER_OS=${RUNNER_OS:-<unset>} RUNNER_ARCH=${RUNNER_ARCH:-<unset>} RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-<unset>}"
+          echo "python3: $(command -v python3) $(python3 --version 2>&1)"
+          echo "python3 sys.version: $(python3 -c 'import sys; print(sys.version.replace(chr(10), " "))')"
+          echo "--- env names matching image/runner:"; env | cut -d= -f1 | grep -iE '^(image|runner_|agent_)' | sort
+          echo "--- /imagegeneration:"; ls /imagegeneration 2>&1 | head
+          echo "--- imagedata.json:"; cat /imagegeneration/imagedata.json 2>&1 | head -40
+          echo "--- /etc/os-release:"; head -4 /etc/os-release
+          echo "--- uname: $(uname -r)"
       - name: Reviewer unit tests (offline)
         shell: bash
         run: REVIEWER_WORKFLOW_TESTS=required PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/reviewer/tests -v
