@@ -267,6 +267,25 @@ jobs:
           echo "claude --version: $raw — equals expected '$expected'"
           echo "path=$dest/claude" >> "$GITHUB_OUTPUT"
 
+      # §18′ п.18 (D-143 §d): среда прогона против .github/environment.lock.json.
+      # Образ и python3 прогон не красят: строка ENV_CHECK в журнал и артефакт
+      # со снятыми пунктами 6, 7, 10, 13, 16; механика в репозиторий не пишет.
+      - name: Environment check (runtime)
+        shell: bash
+        env:
+          CLAUDE_PATH: ${{ steps.claude_cli.outputs.path }}
+        run: python3 .github/reviewer/env_check.py runtime --workflow agent --cli "$CLAUDE_PATH" --out "$RUNNER_TEMP/env-check.json"
+
+      - name: Upload environment check
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: env-check-agent-${{ github.run_id }}
+          path: ${{ runner.temp }}/env-check.json
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Run role
         id: role
         # Таймаут шага меньше таймаута job: при срабатывании шаг проваливается,

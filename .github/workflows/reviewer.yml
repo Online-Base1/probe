@@ -158,6 +158,54 @@ jobs:
           OPENAI_WIF_AUDIENCE: ${{ vars.OPENAI_WIF_AUDIENCE }}
         run: /tmp/venv/bin/python .github/reviewer/reviewer.py review
 
+  # Положительная контрольная (§18′ п.18, D-143 §f): в КАЖДОМ прогоне, не
+  # завися от resolve, — заведомо запрещённые записи (п1) комментарий в
+  # factory-knowledge токеном contents:read, (п2) APPROVE канареечной заявки
+  # токеном probe; обе обязаны получить 403. Каждая печатает строку
+  # REFUSAL_PROBE; сводка обязана найти её в журнале — не нашла ни в одном
+  # прогоне за окно, значит механика извлечения слепа (красный). Раньше пробы
+  # жили только в job review и при resolve=UNKNOWN не выполнялись (5 из 8
+  # прогонов 06–12.10). Те же два узких токена, что у review.
+  refusal-probes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Checkout reviewer code (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/reviewer/
+          sparse-checkout-cone-mode: false
+
+      - name: Mint probe token (factory-knowledge, contents:read)
+        id: fk
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: factory-knowledge
+          permission-contents: read
+
+      - name: Mint probe token (probe, issues:write, pull-requests:read)
+        id: pr
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+          permission-pull-requests: read
+
+      - name: Refusal probes
+        shell: bash
+        env:
+          GH_TOKEN_KNOWLEDGE: ${{ steps.fk.outputs.token }}
+          GH_TOKEN_PROBE: ${{ steps.pr.outputs.token }}
+          REPO: ${{ github.repository }}
+        run: python3 .github/reviewer/reviewer.py probes
+
   report:
     needs: [resolve, review]
     if: always()
@@ -173,7 +221,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: .github/reviewer/
+          sparse-checkout: |
+            .github/reviewer/
+            .github/environment.lock.json
           sparse-checkout-cone-mode: false
 
       - name: REVIEW_RESULT
@@ -195,3 +245,21 @@ jobs:
           REVIEW_MODEL: ${{ needs.review.outputs.model }}
           REVIEW_CANARY: ${{ needs.review.outputs.canary }}
         run: python3 .github/reviewer/reviewer.py report
+
+      # §18′ п.18 (D-143 §d): среда прогона против .github/environment.lock.json.
+      # Образ и python3 прогон не красят: строка ENV_CHECK в журнал и артефакт
+      # со снятыми пунктами 6, 7, 10, 13, 16; механика в репозиторий не пишет.
+      - name: Environment check (runtime)
+        if: always()
+        shell: bash
+        run: python3 .github/reviewer/env_check.py runtime --workflow reviewer --out "$RUNNER_TEMP/env-check.json"
+
+      - name: Upload environment check
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: env-check-reviewer-${{ github.run_id }}
+          path: ${{ runner.temp }}/env-check.json
+          retention-days: 90
+          if-no-files-found: error

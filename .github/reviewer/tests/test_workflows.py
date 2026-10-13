@@ -158,6 +158,69 @@ class Workflows(unittest.TestCase):
                 on = read(name).split("\non:", 1)[1].split("\npermissions:", 1)[0]
                 self.assertNotRegex(on, r"(?m)^\s+(issues|issue_comment|discussion|discussion_comment):", name)
 
+    # --- §18′ п.18 (D-143): названная среда и положительная контрольная ---
+
+    def step_block(self, text, name):
+        i = text.index(f"- name: {name}\n")
+        j = text.find("\n      - name: ", i + 1)
+        return text[i:j if j != -1 else len(text)]
+
+    def test_refusal_probes_job_runs_every_time(self):
+        t = read("reviewer.yml")
+        job = job_block(t, "refusal-probes")
+        # Не зависит от resolve: ни needs, ни if на уровне job.
+        self.assertNotRegex(job, r"(?m)^    (needs|if):")
+        self.assertIn("    permissions: {}\n", job)
+        fk = self.step_block(job, "Mint probe token (factory-knowledge, contents:read)")
+        self.assertIn("repositories: factory-knowledge", fk)
+        self.assertEqual(re.findall(r"permission-[a-z-]+: \w+", fk), ["permission-contents: read"])
+        pr = self.step_block(job, "Mint probe token (probe, issues:write, pull-requests:read)")
+        self.assertEqual(sorted(re.findall(r"permission-[a-z-]+: \w+", pr)),
+                         ["permission-issues: write", "permission-pull-requests: read"])
+        self.assertIn("run: python3 .github/reviewer/reviewer.py probes", job)
+        self.assertEqual(rl.REFUSAL_MARKER, "REFUSAL_PROBE")
+
+    def test_static_env_check_in_reviewer_ci(self):
+        unit = job_block(read("reviewer-ci.yml"), "unit")
+        self.assertIn("            .github/environment.lock.json\n", unit)
+        self.assertLess(unit.index("run: python3 .github/reviewer/env_check.py static"),
+                        unit.index("- name: Reviewer unit tests (offline)"))
+        self.assertNotIn("continue-on-error", self.step_block(unit, "Environment lock (static)"))
+
+    def test_runtime_env_check_in_three_workflows(self):
+        for name, wf in (("reviewer.yml", "reviewer"), ("agent.yml", "agent"), ("digest.yml", "digest")):
+            t = read(name)
+            check = self.step_block(t, "Environment check (runtime)")
+            self.assertIn(f"env_check.py runtime --workflow {wf}", check, name)
+            self.assertIn('--out "$RUNNER_TEMP/env-check.json"', check, name)
+            up = self.step_block(t, "Upload environment check")
+            self.assertIn("actions/upload-artifact@", up, name)
+            self.assertIn(f"name: env-check-{wf}-${{{{ github.run_id }}}}", up, name)
+            self.assertIn("if: always()", up, name)
+            self.assertIn("continue-on-error: true", up, name)
+            self.assertLess(t.index("- name: Environment check (runtime)"), t.index("- name: Upload environment check"))
+
+    def test_runtime_env_check_placement(self):
+        rv_ = job_block(read("reviewer.yml"), "report")
+        self.assertIn("            .github/environment.lock.json\n", rv_)
+        self.assertLess(rv_.index("- name: REVIEW_RESULT"), rv_.index("- name: Environment check (runtime)"))
+        self.assertIn("if: always()", self.step_block(rv_, "Environment check (runtime)"))
+        dg = read("digest.yml")
+        self.assertIn("            .github/environment.lock.json\n", dg)
+        # сводка выходит и при сломанной сверке (D-121 §c)
+        self.assertIn("continue-on-error: true", self.step_block(dg, "Environment check (runtime)"))
+        self.assertLess(dg.index("- name: Environment check (runtime)"), dg.index("- name: Digest\n"))
+        self.assertIn("ENV_CHECK_FILE: ${{ runner.temp }}/env-check.json", self.step_block(dg, "Digest"))
+        role = job_block(read("agent.yml"), "role")
+        check = self.step_block(role, "Environment check (runtime)")
+        # версия CLI — наша: расхождение обязано остановить роль до её запуска
+        self.assertIn('--cli "$CLAUDE_PATH"', check)
+        self.assertIn("CLAUDE_PATH: ${{ steps.claude_cli.outputs.path }}", check)
+        self.assertNotIn("continue-on-error", check)
+        self.assertNotIn("if: always()", check)
+        self.assertLess(role.index("- name: Install Claude Code (verified)"), role.index("- name: Environment check (runtime)"))
+        self.assertLess(role.index("- name: Environment check (runtime)"), role.index("- name: Run role"))
+
     def test_subset_token_test(self):
         t = read("reviewer-app-token-test.yml")
         self.assertIn('{"repositories":["factory-knowledge"],"permissions":{"contents":"read"}}', t)

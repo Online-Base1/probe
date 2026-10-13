@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +21,7 @@ TITLES = [t for _, t in dl.LINES]
 
 
 def reviewer_log(upstream=CANARY_RUN, trigger="canary", result="DONE", findings="1", canary="PASS",
-                 retention="not_observed", models=("PASS", "PASS", "PASS")):
+                 retention="not_observed", models=("PASS", "PASS", "PASS"), probes=True):
     # Вид строк — как в журнале прогона 38130814643 (метка времени перед текстом).
     t = "2026-10-12T10:20:56.5993704Z "
     lines = [t + json.dumps({"run_id": str(upstream), "trigger": trigger, "pr": "34", "head_sha": "a" * 40},
@@ -29,6 +30,9 @@ def reviewer_log(upstream=CANARY_RUN, trigger="canary", result="DONE", findings=
         lines += [t + f"(в) models.list == expected: {models[0]} — models=['gpt-5.3-codex']",
                   t + f"(г) responses.create allowed model: {models[1]} — model=gpt-5.3-codex",
                   t + f"(д) responses.create denied model: {models[2]} — code=model_not_found"]
+    if probes:
+        lines += [t + "REFUSAL_PROBE name=p1_knowledge_comment status=403 result=refused",
+                  t + "REFUSAL_PROBE name=p2_canary_approve status=403 result=refused"]
     lines.append(t + f"REVIEW_LEDGER kind={trigger} pr=34 head={'a' * 40} run_date=2026-10-12 expires=not_observed "
                      f"retention={retention} result={result} findings={findings} prompt_sha=c format_sha=f "
                      f"model=gpt-5.3-codex canary={canary} d086=excluded")
@@ -69,6 +73,27 @@ def merges_src(commits=None, pulls=None, merged_by=None, base=BASE_SHA, tip=TIP_
     return {"tip": tip, "base": base, "compare": cmp, "pulls": pulls or {}, "pull_detail": detail}
 
 
+class _AllJobs(dict):
+    """Каждый прогон ревьюера в фикстуре — с job контрольной."""
+
+    def get(self, key, default=None):
+        return ["resolve", "refusal-probes", "review", "report"]
+
+
+JOBS_WITH_CONTROL = _AllJobs()
+LOCK_IMAGE = "20261004.327.1"
+
+
+def env_result(status="match", image=LOCK_IMAGE, python="3.12.3", unread=()):
+    """Результат env_check.py runtime, как его пишет шаг Environment check."""
+    import env_lib as el
+    lock = {"image_os": "ubuntu24", "image_version": LOCK_IMAGE, "python3": "3.12.3", "claude_code_version": "2.1.283"}
+    actual = {"image_os": "ubuntu24", "image_version": image, "python3": python}
+    for f in unread:
+        actual[f] = None
+    return el.compare_runtime(lock, actual, el.PLATFORM_FIELDS)
+
+
 def obs(**over):
     o = {
         "now": NOW,
@@ -79,6 +104,8 @@ def obs(**over):
         "own_created": "2026-10-12T10:47:00Z",
         "previous_digest": None,
         "reviewer_logs": {REVIEWER_RUN: reviewer_log()},
+        "reviewer_jobs": JOBS_WITH_CONTROL,
+        "env_check": env_result(),
         "oldest_reviewer_created": "2026-09-28T19:00:00Z",
         "bypass": {r: {"day": [], "all": [{"id": 1}], "allowed": True} for r in dl.BYPASS_REPOS},
         "open_prs": [],
@@ -131,7 +158,8 @@ class Shape(unittest.TestCase):
                                 "prless_branch=0 worklog_age=1 models=PASS standards_age=2 "
                                 "checks_changed=probe:0,factory-ci:0,factory-knowledge:0,online-base:0,cost-panel:0 "
                                 "complete=yes "
-                                "merges=probe:0/0/0,factory-ci:0/0/0,factory-knowledge:0/0/0,online-base:0/0/0,cost-panel:0/0/0")
+                                "merges=probe:0/0/0,factory-ci:0/0/0,factory-knowledge:0/0/0,online-base:0/0/0,cost-panel:0/0/0 "
+                                "env=match@20261004.327.1 control=ok:1/1")
         self.assertIn("(первая сводка: окно 24 ч)", body)
         self.assertIn("окно 2026-10-11T10:47Z … 2026-10-12T10:47Z", body)
 
@@ -144,11 +172,13 @@ class Shape(unittest.TestCase):
             self.assertEqual(line(body, title),
                              f"{title}: не наблюдалось: прогона по расписанию не было")
         self.assertEqual(line(body, "НОЧЬ"), "НОЧЬ: прогонов 0, красных 0, UNKNOWN 0 (из 0 прогонов ревьюера)")
-        self.assertEqual(incomplete, ["РЕВЬЮЕР", "КАНАРЕЙКА", "СРОК ХРАНЕНИЯ", "МОДЕЛИ"])
-        self.assertTrue(body.endswith("СВОДКА НЕПОЛНАЯ: РЕВЬЮЕР, КАНАРЕЙКА, СРОК ХРАНЕНИЯ, МОДЕЛИ\n"))
+        self.assertEqual(incomplete, ["РЕВЬЮЕР", "КАНАРЕЙКА", "СРОК ХРАНЕНИЯ", "МОДЕЛИ", "КОНТРОЛЬНАЯ"])
+        self.assertEqual(line(body, "КОНТРОЛЬНАЯ"),
+                         "КОНТРОЛЬНАЯ: не наблюдалось: прогонов ревьюера за окно не было — контрольной нечего показать")
+        self.assertTrue(body.endswith("СВОДКА НЕПОЛНАЯ: РЕВЬЮЕР, КАНАРЕЙКА, СРОК ХРАНЕНИЯ, МОДЕЛИ, КОНТРОЛЬНАЯ\n"))
         self.assertIn(" reviewer=not_observed findings=not_observed canary=not_observed retention=not_observed "
                       "expires_in=not_observed ", dline)
-        self.assertIn(" complete=no:reviewer,canary,retention,models merges=", dline)
+        self.assertIn(" complete=no:reviewer,canary,retention,models,control merges=", dline)
 
     def test_runs_unreadable(self):
         body, dline, incomplete = dl.build(obs(runs=dl.Missing("нет права actions:read (HTTP 403)")), 1)
@@ -163,12 +193,14 @@ class Shape(unittest.TestCase):
         body, dline, incomplete = dl.build(o, 1)
         self.assertShape(body, dline)
         o["merges"] = {r: merges_src(commits=m) for r in dl.MERGES_REPOS}
+        o["env_check"], o["reviewer_logs"] = m, {}
         body, dline, incomplete = dl.build(o, 1)
         self.assertShape(body, dline)
         five = "probe, factory-ci, factory-knowledge, online-base, cost-panel"
         self.assertEqual(incomplete, [
             "НОЧЬ", "РЕВЬЮЕР", "КАНАРЕЙКА", "СРОК ХРАНЕНИЯ", "ОБХОДЫ (probe, factory-knowledge, online-base)",
-            f"ВЛИВАНИЯ ({five})", "ЗАЯВКИ БЕЗ ВЕТКИ", "ЖУРНАЛ", "МОДЕЛИ", "ПРАВИЛА", f"ИЗМЕНЕНИЕ ПРОВЕРОК ({five})"])
+            f"ВЛИВАНИЯ ({five})", "ЗАЯВКИ БЕЗ ВЕТКИ", "ЖУРНАЛ", "МОДЕЛИ", "ПРАВИЛА", f"ИЗМЕНЕНИЕ ПРОВЕРОК ({five})",
+            "СРЕДА", "КОНТРОЛЬНАЯ"])
         self.assertTrue(all("не наблюдалось" in h for h in lines_of(body)[:len(TITLES)]))
         self.assertIn("complete=no:night,reviewer,canary,retention,bypass(probe+factory-knowledge+online-base),", dline)
 
@@ -353,7 +385,7 @@ class Merges(unittest.TestCase):
         body, dline, incomplete = self.build(merges_src(dl.Missing("репозиторий не виден токену (HTTP 404)")),
                                              repo=dl.ONLINE_BASE_REPO)
         self.assertIn("online-base: не наблюдалось: репозиторий не виден токену (HTTP 404)", line(body, "ВЛИВАНИЯ"))
-        self.assertTrue(dline.endswith(",online-base:not_observed,cost-panel:0/0/0"))
+        self.assertIn(",online-base:not_observed,cost-panel:0/0/0 env=", dline)
         self.assertEqual(incomplete, ["ВЛИВАНИЯ (online-base)", "ИЗМЕНЕНИЕ ПРОВЕРОК (online-base)"])
 
     def test_merge_commit_sha_decides(self):
@@ -386,6 +418,100 @@ class CommitFiles(unittest.TestCase):
 
     def test_no_range_no_requests(self):
         self.assertEqual(dg.commit_files(None, dl.PROBE_REPO, {"compare": None}), {})
+
+
+class EnvLine(unittest.TestCase):
+    """СРЕДА (§18′ п.18, D-143): совпадает / отличается / не вычислено."""
+
+    def test_match_names_image(self):
+        body, dline, incomplete = dl.build(obs(), 1)
+        self.assertEqual(line(body, "СРЕДА"), "СРЕДА: совпадает с .github/environment.lock.json: "
+                                              "образ 20261004.327.1, ImageOS ubuntu24, python3 3.12.3")
+        self.assertIn(" env=match@20261004.327.1 ", dline)
+        self.assertEqual(incomplete, [])
+
+    def test_drift_names_old_new_and_items(self):
+        body, dline, incomplete = dl.build(obs(env_check=env_result("drift", image="20261011.1.1", python="3.12.4")), 1)
+        self.assertEqual(line(body, "СРЕДА"), "СРЕДА: отличается от .github/environment.lock.json: "
+                                              "image_version 20261004.327.1 → 20261011.1.1; python3 3.12.3 → 3.12.4; "
+                                              "доказанность пунктов §18′ 6, 7, 10, 13, 16 снята")
+        self.assertIn(" env=drift:image_version+python3 ", dline)
+        self.assertEqual(incomplete, [])  # наблюдено, не пробел
+
+    def test_not_computed_artifact_missing(self):
+        m = dl.Missing("сверка среды не создала результата: шаг Environment check не выполнился")
+        body, dline, incomplete = dl.build(obs(env_check=m), 1)
+        self.assertEqual(line(body, "СРЕДА"), "СРЕДА: не наблюдалось: сверка среды не создала результата: "
+                                              "шаг Environment check не выполнился")
+        self.assertIn(" env=not_observed ", dline)
+        self.assertEqual(incomplete, ["СРЕДА"])
+
+    def test_not_computed_unread_and_lock_error(self):
+        body, _, incomplete = dl.build(obs(env_check=env_result(unread=("image_version",))), 1)
+        self.assertEqual(line(body, "СРЕДА"), "СРЕДА: не наблюдалось: не прочитано: image_version; "
+                                              "доказанность пунктов §18′ 6, 7, 10, 13, 16 не подтверждена")
+        import env_lib as el
+        body, _, _ = dl.build(obs(env_check=el.lock_error_result("в lock-файле нет поля python3")), 1)
+        self.assertEqual(line(body, "СРЕДА"), "СРЕДА: не наблюдалось: в lock-файле нет поля python3; "
+                                              "доказанность пунктов §18′ 6, 7, 10, 13, 16 не подтверждена")
+
+
+class ControlLine(unittest.TestCase):
+    """КОНТРОЛЬНАЯ (D-143 §f): заведомые пробы-отказы в каждом прогоне ревьюера."""
+
+    def build(self, logs, jobs=None):
+        return dl.build(obs(reviewer_logs=logs, reviewer_jobs=jobs if jobs is not None else JOBS_WITH_CONTROL), 1)
+
+    def test_found_in_all(self):
+        body, dline, incomplete = self.build({3: reviewer_log(upstream=111, trigger="agent"), REVIEWER_RUN: reviewer_log()})
+        self.assertEqual(line(body, "КОНТРОЛЬНАЯ"),
+                         f"КОНТРОЛЬНАЯ: проба-отказ найдена во всех 2 прогонах ревьюера (3, {REVIEWER_RUN})")
+        self.assertTrue(dline.endswith(" control=ok:2/2"))
+        self.assertEqual(incomplete, [])
+
+    def test_found_in_none_is_blind_red(self):
+        body, dline, incomplete = self.build({REVIEWER_RUN: reviewer_log(probes=False)})
+        self.assertEqual(line(body, "КОНТРОЛЬНАЯ"),
+                         f"КОНТРОЛЬНАЯ: КРАСНЫЙ: механика извлечения отказов слепа — заведомая проба-отказ не найдена "
+                         f"ни в одном из 1 прогонов ревьюера ({REVIEWER_RUN})")
+        self.assertTrue(dline.endswith(" control=blind:0/1"))
+        self.assertEqual(incomplete, [])  # наблюдено и красное — не пробел
+
+    def test_partial_is_gap(self):
+        body, dline, incomplete = self.build({3: reviewer_log(probes=False), REVIEWER_RUN: reviewer_log()})
+        self.assertIn("проба-отказ найдена в 1 из 2 прогонов ревьюера; не найдена: 3", line(body, "КОНТРОЛЬНАЯ"))
+        self.assertTrue(dline.endswith(" control=partial:1/2"))
+        self.assertEqual(incomplete, ["КОНТРОЛЬНАЯ"])
+
+    def test_runs_before_control_job_are_not_blindness(self):
+        body, dline, incomplete = self.build({REVIEWER_RUN: reviewer_log(probes=False)},
+                                             {REVIEWER_RUN: ["resolve", "review", "report"]})
+        self.assertEqual(line(body, "КОНТРОЛЬНАЯ"), "КОНТРОЛЬНАЯ: не наблюдалось: контрольная не проверялась ни в одном "
+                                                    f"прогоне; до введения контрольной (нет job refusal-probes): {REVIEWER_RUN}")
+        self.assertTrue(dline.endswith(" control=not_observed"))
+        self.assertEqual(incomplete, ["КОНТРОЛЬНАЯ"])
+
+    def test_probe_not_refused_is_red(self):
+        log = reviewer_log().replace("REFUSAL_PROBE name=p2_canary_approve status=403 result=refused",
+                                     "REFUSAL_PROBE name=p2_canary_approve status=200 result=allowed")
+        body, dline, _ = self.build({REVIEWER_RUN: log})
+        self.assertIn(f"КРАСНЫЙ: проба не получила отказ — {REVIEWER_RUN} p2_canary_approve 200 allowed",
+                      line(body, "КОНТРОЛЬНАЯ"))
+
+    def test_unread_log_or_jobs(self):
+        body, _, incomplete = self.build({REVIEWER_RUN: reviewer_log(), 5: dl.Missing("журнал прогона 5: HTTP 410")})
+        self.assertIn("не прочитаны: 5: журнал прогона 5: HTTP 410", line(body, "КОНТРОЛЬНАЯ"))
+        self.assertEqual(incomplete, ["НОЧЬ", "КОНТРОЛЬНАЯ"])  # НОЧЬ: UNKNOWN не досчитан по тому же журналу
+        body, _, _ = self.build({REVIEWER_RUN: reviewer_log()}, {REVIEWER_RUN: dl.Missing("нет права actions:read (HTTP 403)")})
+        self.assertIn("не наблюдалось: контрольная не проверялась ни в одном прогоне; не прочитаны: "
+                      f"{REVIEWER_RUN}: нет права actions:read (HTTP 403)", line(body, "КОНТРОЛЬНАЯ"))
+
+    def test_marker_matches_reviewer_lib(self):
+        import reviewer_lib as rl
+        self.assertEqual(dl.refusals_of(rl.refusal_line("p1_knowledge_comment", 403)),
+                         [("p1_knowledge_comment", "403", "refused")])
+        self.assertEqual(rl.refusal_line("p2", 201), "REFUSAL_PROBE name=p2 status=201 result=allowed")
+        self.assertEqual(rl.refusal_line("p2", 500), "REFUSAL_PROBE name=p2 status=500 result=unexpected")
 
 
 class Window(unittest.TestCase):
@@ -530,6 +656,7 @@ class Flow(unittest.TestCase):
         self.runs = []
         self.digests = []
         self.files_queries = []
+        self.jobs = {}
         self.commit_files = {"f" * 40: [".github/workflows/digest.yml"]}
         self.main_commits = {F.REPO: [{"sha": "f" * 40}]}
         self.tips = {F.REPO: "f" * 40}
@@ -556,6 +683,10 @@ class Flow(unittest.TestCase):
             return ok({"workflow_runs": self.digests})
         if p == f"/repos/{F.REPO}/actions/runs":
             return ok({"workflow_runs": self.runs if "page=1" in path else []})
+        m_jobs = re.fullmatch(rf"/repos/{F.REPO}/actions/runs/(\d+)/jobs", p)
+        if m_jobs:
+            names = self.jobs.get(int(m_jobs.group(1)), ["resolve", "refusal-probes", "review", "report"])
+            return ok({"jobs": [{"name": n} for n in names] if "page=1" in path else []})
         m_ref = re.fullmatch(r"/repos/([^/]+/[^/]+)/git/ref/heads/main", p)
         if m_ref:
             repo = m_ref.group(1)
@@ -649,6 +780,44 @@ class Flow(unittest.TestCase):
         body, code = dg.run(self.env, self.transport, now=NOW)
         self.assertEqual(code, 0)  # сводка отчитывается о наблюдении и выходит зелёной
         self.assertIn(f"probe: 1/1/0 КРАСНЫЙ: fffffff влил {WORKER}", body)
+
+    def with_env_file(self, result):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "env-check.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh)
+        self.env["ENV_CHECK_FILE"] = path
+
+    def reviewer_run(self, log):
+        self.runs = [run(REVIEWER_RUN, "reviewer.yml", event="workflow_run", created="2026-10-12T10:07:21Z")]
+        self.digest_logs[REVIEWER_RUN] = log
+
+    def test_env_file_read(self):
+        self.with_env_file(env_result("drift", image="20261011.1.1"))
+        body, code = dg.run(self.env, self.transport, now=NOW)
+        self.assertEqual(code, 0)
+        self.assertIn("СРЕДА: отличается от .github/environment.lock.json: image_version 20261004.327.1 → 20261011.1.1", body)
+
+    def test_env_file_absent(self):
+        body, _ = dg.run(self.env, self.transport, now=NOW)
+        self.assertIn("СРЕДА: не наблюдалось: ENV_CHECK_FILE не задан", body)
+        self.env["ENV_CHECK_FILE"] = "/nonexistent/env-check.json"
+        body, _ = dg.run(self.env, self.transport, now=NOW)
+        self.assertIn("СРЕДА: не наблюдалось: сверка среды не создала результата", body)
+
+    def test_blind_control_published_then_red(self):
+        self.reviewer_run(reviewer_log(probes=False))
+        body, code = dg.run(self.env, self.transport, now=NOW)
+        self.assertEqual(len(self.posted), 1)  # сводка опубликована
+        self.assertEqual(code, 1)              # и прогон сводки красный
+        self.assertIn("control=blind:0/1", body)
+
+    def test_control_found_green(self):
+        self.reviewer_run(reviewer_log())
+        body, code = dg.run(self.env, self.transport, now=NOW)
+        self.assertEqual(code, 0)
+        self.assertIn("control=ok:1/1", body)
+        self.assertTrue(any(c[1].endswith(f"/actions/runs/{REVIEWER_RUN}/jobs?per_page=100&page=1") for c in self.calls))
 
     def test_knowledge_token_missing_still_published(self):
         del self.env["GH_TOKEN_KNOWLEDGE"]

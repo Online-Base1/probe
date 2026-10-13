@@ -17,6 +17,9 @@
 пробы BB-37 без администраторского права; ОБХОДЫ — другая величина и остаётся.
 Диапазон вливаний — от вершины main, запомненной прошлой сводкой (D-138 b), а
 не по дате коммиттера; ноль без единого запроса — «(запросов не было)» (D-139).
+СРЕДА — сверка среды прогона сводки с environment.lock.json (§18′ п.18, D-143);
+КОНТРОЛЬНАЯ — заведомые пробы-отказы в каждом прогоне ревьюера за окно: не
+найдены ни в одном — механика извлечения слепа, прогон сводки красный (D-143 §f).
 
 Всё, что приходит из сети, передаётся сюда уже полученным (digest.py); то,
 что получить не удалось, приходит как Missing(причина). Так каждая строка
@@ -73,6 +76,8 @@ LINES = (
     ("models", "МОДЕЛИ"),
     ("standards", "ПРАВИЛА"),
     ("checks", "ИЗМЕНЕНИЕ ПРОВЕРОК"),
+    ("env", "СРЕДА"),
+    ("control", "КОНТРОЛЬНАЯ"),
 )
 FIELDS_OF = {
     "night": ("runs", "red", "unknown"),
@@ -86,10 +91,12 @@ FIELDS_OF = {
     "standards": ("standards_age",),
     "checks": ("checks_changed",),
     "merges": ("merges",),
+    "env": ("env",),
+    "control": ("control",),
 }
 DIGEST_FIELDS = ("seq", "date", "runs", "red", "unknown", "reviewer", "findings", "canary", "retention",
                  "expires_in", "bypass_24h", "bypass_30d", "prless_branch", "worklog_age", "models",
-                 "standards_age", "checks_changed", "complete", "merges")
+                 "standards_age", "checks_changed", "complete", "merges", "env", "control")
 
 RED_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required", "cancelled", "stale"}
 MODEL_CHECKS = ("в", "г", "д")
@@ -98,6 +105,7 @@ _UPSTREAM = re.compile(r'"run_id": "(\d+)", "trigger": "(\w*)"')
 _LEDGER = re.compile(r"REVIEW_LEDGER (\S.*)$", re.M)
 _FIELD = re.compile(r"(\w+)=(\S*)")
 _HEADS = re.compile(r"DIGEST_HEADS((?: [\w.-]+=[0-9a-f]{40})*)")
+_REFUSAL = re.compile(r"REFUSAL_PROBE name=(\S+) status=(\d+) result=(\w+)")
 _MODEL = re.compile(r"\((в|г|д)\) [^:\n]+: (PASS|FAIL|UNKNOWN)\b")
 
 
@@ -498,9 +506,85 @@ def line_checks(obs):
     return "коммитов в .github/ на main — " + "; ".join(parts), {"checks_changed": ",".join(fields)}, gaps
 
 
+LOCK_NAME = ".github/environment.lock.json"
+# Job контрольной в reviewer.yml (§18′ п.18, D-143 §f): прогон без него — до
+# введения контрольной, а не слепота механики.
+CONTROL_JOB = "refusal-probes"
+
+
+def line_env(obs):
+    """Среда прогона сводки против environment.lock.json (§18′ п.18, D-143 §d)."""
+    r = need(obs["env_check"])
+    status = r.get("status")
+    items = ", ".join(map(str, r.get("unproven_items") or []))
+    if status == "match":
+        c = r["checked"]
+        image = c["image_version"]["actual"]
+        return (f"совпадает с {LOCK_NAME}: образ {image}, ImageOS {c['image_os']['actual']}, "
+                f"python3 {c['python3']['actual']}"), {"env": f"match@{image}"}, []
+    if status in ("drift", "red"):
+        changes = "; ".join(f"{d['field']} {d['expected']} → {d['actual']}" for d in r["red"] + r["diffs"])
+        unread = f"; не прочитано: {', '.join(r['unread'])}" if r.get("unread") else ""
+        return (("КРАСНЫЙ: " if status == "red" else "") + f"отличается от {LOCK_NAME}: {changes}{unread}; "
+                f"доказанность пунктов §18′ {items} снята"), \
+            {"env": f"{status}:" + "+".join(d["field"] for d in r["red"] + r["diffs"])}, []
+    if status == "unknown":
+        raise NotObserved(f"не прочитано: {', '.join(r.get('unread') or [])}; доказанность пунктов §18′ {items} не подтверждена")
+    raise NotObserved(f"{r.get('reason') or 'статус сверки ' + str(status)}; доказанность пунктов §18′ {items} не подтверждена")
+
+
+def refusals_of(log):
+    """Строки REFUSAL_PROBE журнала: [(имя, статус, исход)]."""
+    return _REFUSAL.findall(log or "")
+
+
+def line_control(obs):
+    """Положительная контрольная (D-143 §f): в каждом прогоне ревьюера за окно —
+    заведомая проба-отказ в журнале. Ни в одном — механика слепа: blind, прогон
+    сводки красный (иначе её устойчивый ноль неотличим от отсутствия событий,
+    D-139). Проба, НЕ получившая отказ, — КРАСНЫЙ в строке."""
+    logs, jobs = obs["reviewer_logs"], obs["reviewer_jobs"]
+    if not logs:
+        raise NotObserved("прогонов ревьюера за окно не было — контрольной нечего показать")
+    found, missing, before, unread, allowed = [], [], [], [], []
+    for rid in sorted(logs):
+        log, names = logs[rid], jobs.get(rid, Missing("задания прогона не запрошены"))
+        if isinstance(log, Missing) or isinstance(names, Missing):
+            unread.append(f"{rid}: {(log if isinstance(log, Missing) else names).reason}")
+            continue
+        if CONTROL_JOB not in names:
+            before.append(str(rid))
+            continue
+        probes = refusals_of(log)
+        allowed += [f"{rid} {n} {s} {res}" for n, s, res in probes if res != "refused"]
+        (found if any(res == "refused" for _, _, res in probes) else missing).append(str(rid))
+    considered = len(found) + len(missing)
+    notes = []
+    if before:
+        notes.append(f"до введения контрольной (нет job {CONTROL_JOB}): {', '.join(before)}")
+    if unread:
+        notes.append("не прочитаны: " + "; ".join(unread))
+    if allowed:
+        notes.append("КРАСНЫЙ: проба не получила отказ — " + ", ".join(allowed))
+    tail = ("; " + "; ".join(notes)) if notes else ""
+    if not considered:
+        raise NotObserved("контрольная не проверялась ни в одном прогоне" + tail)
+    if not found:
+        return (f"КРАСНЫЙ: механика извлечения отказов слепа — заведомая проба-отказ не найдена ни в одном "
+                f"из {considered} прогонов ревьюера ({', '.join(missing)}){tail}"), \
+            {"control": f"blind:0/{considered}"}, []
+    if missing or unread:
+        return (f"проба-отказ найдена в {len(found)} из {considered} прогонов ревьюера; не найдена: "
+                f"{', '.join(missing) or '—'}{tail}"), {"control": f"partial:{len(found)}/{considered}"}, \
+            ["не во всех прогонах"]
+    return (f"проба-отказ найдена во всех {considered} прогонах ревьюера ({', '.join(found)}){tail}"), \
+        {"control": f"ok:{len(found)}/{considered}"}, []
+
+
 LINE_FUNCS = {"night": line_night, "reviewer": line_reviewer, "canary": line_canary, "retention": line_retention,
               "bypass": line_bypass, "prless": line_prless, "worklog": line_worklog, "models": line_models,
-              "standards": line_standards, "checks": line_checks, "merges": line_merges}
+              "standards": line_standards, "checks": line_checks, "merges": line_merges,
+              "env": line_env, "control": line_control}
 
 
 def compute_line(key, obs):

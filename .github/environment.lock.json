@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "runner_label": "ubuntu-24.04",
+  "image_os": "ubuntu24",
+  "image_version": "20261004.327.1",
+  "python3": "3.12.3",
+  "claude_code_version": "2.1.283",
+  "uses": {
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/create-github-app-token": "bcd2ba49218906704ab6c1aa796996da409d3eb1",
+    "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    "anthropics/claude-code-action": "756cc22e19660d20e8cc9496b4f242475a7f7790",
+    "Online-Base1/factory-ci/.github/workflows/gates.yml": "37e7f4b209218f1ddb140dd3d64b7ff042bc0ee2"
+  },
+  "transitive_observed": {
+    "oven-sh/setup-bun": "0c5077e51419868618aeaa5fe8019c62421857d6"
+  },
+  "hashed_requirements": [
+    ".github/workflows/anthropic-wif-test.requirements.txt",
+    ".github/workflows/openai-wif-test.requirements.txt"
+  ],
+  "observed_in": {
+    "runner_label": "38343423923 (reviewer-ci, 2026-10-13): Set up job — Image: ubuntu-24.04",
+    "image_os": "38343423923: ImageOS=ubuntu24",
+    "image_version": "38343423923: ImageVersion=20261004.327.1 = /imagegeneration/imagedata.json",
+    "python3": "38343423923: /usr/bin/python3 — Python 3.12.3",
+    "claude_code_version": "36468629520 (agent, 2026-09-28, образ 20260920.314.1): claude --version: 2.1.283 (Claude Code)",
+    "actions/checkout": "38294179341 (digest), 36468629520 (agent): Download action repository … (SHA:3d3c42e…)",
+    "actions/create-github-app-token": "38294179341 (digest), 38239984832 (canary-trigger), 36468629520 (agent)",
+    "actions/upload-artifact": "38239984832 (canary-trigger), 36468629520 (agent)",
+    "anthropics/claude-code-action": "36468629520 (agent)",
+    "Online-Base1/factory-ci/.github/workflows/gates.yml": "38343424689 (ci на probe#47): referenced_workflows",
+    "oven-sh/setup-bun": "36468629520 (agent): скачан claude-code-action, в наших потоках не упоминается",
+    "hashed_requirements": "рабочее дерево; установка с --require-hashes --only-binary=:all: в reviewer.yml, openai-wif-test.yml, anthropic-wif-test.yml"
+  }
+}

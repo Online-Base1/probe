@@ -31,21 +31,28 @@ jobs:
           sparse-checkout: |
             .github/reviewer/
             .github/workflows/
+            .github/environment.lock.json
           sparse-checkout-cone-mode: false
-      # Шаг 0 задания §18′ п.18: наблюдение среды. Временный, заменяется сверкой.
-      - name: Observe runner environment (step 0)
+      # §18′ п.18 (D-143 §d): рабочее дерево против названной среды — runs-on,
+      # uses@SHA, CLAUDE_CODE_VERSION, требования с хешами. Эти значения меняет
+      # только наша заявка; любое расхождение — красный.
+      - name: Environment lock (static)
         shell: bash
-        run: |
-          echo "ImageOS=${ImageOS:-<unset>}"
-          echo "ImageVersion=${ImageVersion:-<unset>}"
-          echo "RUNNER_OS=${RUNNER_OS:-<unset>} RUNNER_ARCH=${RUNNER_ARCH:-<unset>} RUNNER_ENVIRONMENT=${RUNNER_ENVIRONMENT:-<unset>}"
-          echo "python3: $(command -v python3) $(python3 --version 2>&1)"
-          echo "python3 sys.version: $(python3 -c 'import sys; print(sys.version.replace(chr(10), " "))')"
-          echo "--- env names matching image/runner:"; env | cut -d= -f1 | grep -iE '^(image|runner_|agent_)' | sort
-          echo "--- /imagegeneration:"; ls /imagegeneration 2>&1 | head
-          echo "--- imagedata.json:"; cat /imagegeneration/imagedata.json 2>&1 | head -40
-          echo "--- /etc/os-release:"; head -4 /etc/os-release
-          echo "--- uname: $(uname -r)"
+        run: python3 .github/reviewer/env_check.py static
+      # Та же динамическая сверка, что в reviewer/agent/digest: в прогоне заявки
+      # она наблюдается до вливания. Прогон не красит.
+      - name: Environment check (runtime)
+        shell: bash
+        run: python3 .github/reviewer/env_check.py runtime --workflow reviewer-ci --out "$RUNNER_TEMP/env-check.json"
+      - name: Upload environment check
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: env-check-reviewer-ci-${{ github.run_id }}
+          path: ${{ runner.temp }}/env-check.json
+          retention-days: 90
+          if-no-files-found: error
       - name: Reviewer unit tests (offline)
         shell: bash
         run: REVIEWER_WORKFLOW_TESTS=required PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s .github/reviewer/tests -v
