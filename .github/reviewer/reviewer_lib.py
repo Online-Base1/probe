@@ -428,6 +428,31 @@ def canary_found(findings):
 _TOKEN_RE = re.compile(r"(ghs_|gh[opur]_|github_pat_|sk-ant-|sk-|eyJ)[A-Za-z0-9_.-]+")
 
 
+# Заголовки ответа, которыми площадка сама называет недостающее право
+# (D-140: право — по названному отказу, а не по догадке).
+REFUSAL_HEADERS = ("X-Accepted-GitHub-Permissions", "X-OAuth-Scopes", "X-Accepted-OAuth-Scopes")
+COMMENT_REFUSAL_MARK = "COMMENT_POST_REFUSED"
+
+
+def _header(headers, name):
+    for k, v in (headers or {}).items():
+        if k.lower() == name.lower():
+            return v
+    return None
+
+
+def comment_refusal_line(method, path, token_name, token_scope, status, headers, body):
+    """Строка журнала о неуспешной публикации находок (D-146 §d): запрос и ответ
+    площадки как есть. Отсутствующий заголовок — «absent», не догадка. Метка
+    не REFUSAL_PROBE: настоящий отказ публикации не путается с пробой-отказом.
+    Тело — дословно, без токенов; сам токен не печатается, только его имя и область."""
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body or "")
+    text = _TOKEN_RE.sub("<redacted>", " ".join(text.split()))[:2000]
+    hdrs = " ".join(f'{h}="{_header(headers, h)}"' if _header(headers, h) is not None else f"{h}=absent"
+                    for h in REFUSAL_HEADERS)
+    return f"{COMMENT_REFUSAL_MARK} {method} {path} token={token_name}({token_scope}) status={status} {hdrs} body={text}"
+
+
 def clean(text, limit=500):
     """Санитизация как в Surface permission denials (agent.yml)."""
     text = _TOKEN_RE.sub("<redacted>", str(text))
