@@ -839,6 +839,13 @@ class Outcomes(unittest.TestCase):
         self.assertNotRegex(text, r"запрос\w* 0")
         self.assertTrue(field.endswith(",requests=no_source"), field)
 
+    def test_request_run_unreadable_is_gap(self):
+        req = [{"id": "q4", "requested_at": minutes_ago(40), "run_id": 13}]
+        text, field, incomplete = outcomes_of(obs(requests=req, request_runs={"13": dl.Missing("HTTP 403")}))
+        self.assertIn("не вычислено q4: HTTP 403", text)
+        self.assertIn("ИСХОДЫ", incomplete)
+        self.assertTrue(field.startswith("not_observed:"), field)
+
     def test_request_source_unreadable(self):
         text, field, incomplete = outcomes_of(obs(requests=dl.Missing("журнал пульта: HTTP 500")))
         self.assertIn("не наблюдалось: источник запросов не прочитан: журнал пульта: HTTP 500", text)
@@ -854,6 +861,13 @@ class Outcomes(unittest.TestCase):
     def test_own_run_is_not_counted(self):
         text, _, _ = outcomes_of(obs())
         self.assertNotIn(str(OWN_RUN), text)
+
+    def test_own_run_from_status_query_is_not_counted(self):
+        # На живом свой прогон приходит в запросе ?status=in_progress, а не через окно.
+        own = started_run(OWN_RUN, "digest.yml", 1)
+        text, field, _ = outcomes_of(obs(unfinished_runs=[own]))
+        self.assertNotIn(str(OWN_RUN), text)
+        self.assertIn("running=0,", field)
 
     def test_unfinished_before_window_included(self):
         old = started_run(508, "agent.yml", 60 * 30)  # создан за 30 ч до сводки, окно — 24 ч
