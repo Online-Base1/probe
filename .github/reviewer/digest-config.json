@@ -1,0 +1,12 @@
+{
+  "run_deadline_minutes": 30,
+  "run_deadline_source": {
+    "rule": "D-145 §e: наблюдённый максимум длительности прогона × 2, но не менее 30 минут",
+    "observed_max_minutes": 2.58,
+    "observed_max_run": 38288978302,
+    "observed_max_workflow": "ci.yml",
+    "sample": "90 завершённых прогонов probe, created >= 2026-09-29, наблюдено 2026-10-13T20:08Z (run_started_at → updated_at)",
+    "computed": "2.58 × 2 = 5.16 < 30 → 30",
+    "not_in_sample": "agent.yml — за 14 дней прогонов не было; его job timeout 30 минут"
+  }
+}

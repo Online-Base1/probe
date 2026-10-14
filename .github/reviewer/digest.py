@@ -27,6 +27,12 @@ import reviewer_lib as rl  # noqa: E402
 
 REVIEWER_PATH = ".github/workflows/" + rl.REVIEWER_WORKFLOW_FILE
 DIGEST_WORKFLOW_FILE = "digest.yml"
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "digest-config.json")
+# Источник запросов владельца (§18′ п.17, случай 1). Пульта нет (п.3), поэтому
+# источника нет: None, а не пустой список — пустой список читался бы как
+# «запросов не было», а это не наблюдено (D-139). Появится пульт — сюда придёт
+# его журнал запросов в форме digest_lib.match_requests.
+REQUESTS_SOURCE = None
 
 
 def _header(headers, name):
@@ -208,6 +214,39 @@ def env_check(path):
         return dl.Missing("результат сверки среды не JSON")
 
 
+def digest_config(path=CONFIG_PATH):
+    """digest-config.json (срок D-145 §e) или Missing с причиной."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return dl.Missing(f"{dl.CONFIG_NAME} отсутствует")
+    except ValueError:
+        return dl.Missing(f"{dl.CONFIG_NAME} — не JSON")
+
+
+def unfinished_runs(gh, repo):
+    """Незавершённые прогоны любого возраста — по статусам; Missing, если хоть один не прочитан."""
+    out = []
+    for status in dl.UNFINISHED_STATUSES:
+        runs = get_pages(gh, f"/repos/{repo}/actions/runs?status={status}", "actions:read на probe", key="workflow_runs")
+        if isinstance(runs, dl.Missing):
+            return runs
+        out.extend(runs)
+    return out
+
+
+def ci_jobs(gh, repo, runs, start, end):
+    """Задания завершённых прогонов ci.yml окна: сработал ли «gates / verdict»."""
+    if isinstance(runs, dl.Missing):
+        return {}
+    out = {}
+    for r in dl.in_window(runs, start, end):
+        if dl.workflow_file(r) == dl.CI_WORKFLOW_PATH and r.get("status") == "completed":
+            out[r["id"]] = get_pages(gh, f"/repos/{repo}/actions/runs/{r['id']}/jobs", "actions:read на probe", key="jobs")
+    return out
+
+
 def collect(gh_read, gh_knowledge, now, own_run_id, env_file=""):
     """Все источники сводки; каждый — данные либо Missing."""
     probe = dl.PROBE_REPO
@@ -265,6 +304,11 @@ def collect(gh_read, gh_knowledge, now, own_run_id, env_file=""):
         "reviewer_jobs": {rid: job_names(gh_read, probe, rid) for rid in reviewer_logs},
         "env_check": env_check(env_file),
         "checks": {repo: commit_files(tokens[repo], repo, merges[repo]) for repo in dl.CHECKS_REPOS},
+        "digest_config": digest_config(),
+        "unfinished_runs": unfinished_runs(gh_read, probe),
+        "ci_jobs": ci_jobs(gh_read, probe, runs, start, end),
+        "requests": REQUESTS_SOURCE,
+        "request_runs": {},
     }
 
 
