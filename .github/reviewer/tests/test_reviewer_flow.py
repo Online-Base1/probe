@@ -7,6 +7,7 @@ import datetime
 import io
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -296,6 +297,63 @@ class Review(Base):
     def test_comment_post_refused(self):
         self.w.comment_status = 403
         self.assertEqual(self.review()["result"], "UNKNOWN(comment_post:403)")
+
+    def review_printed(self):
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            st = self.review()
+        return st, buf.getvalue()
+
+    def test_comment_refusal_prints_platform_answer_verbatim(self):
+        # D-146 §d: запрос и ответ площадки в журнале, право называет она сама.
+        self.w.comment_status = 403
+        self.w.comment_headers = {"x-accepted-github-permissions": "pull_requests=write", "X-OAuth-Scopes": ""}
+        self.w.comment_body = (b'{"message":"Resource not accessible by integration",'
+                               b'"documentation_url":"https://docs.github.com/rest/issues/comments#create-an-issue-comment","status":"403"}')
+        st, out = self.review_printed()
+        self.assertEqual(st["result"], "UNKNOWN(comment_post:403)")
+        lines = [ln for ln in out.splitlines() if ln.startswith("COMMENT_POST_REFUSED ")]
+        self.assertEqual(len(lines), 1, out)
+        ln = lines[0]
+        self.assertIn(f"POST /repos/{F.REPO}/issues/7/comments token=GH_TOKEN_PROBE(probe: issues:write, pull-requests:read) status=403", ln)
+        self.assertIn('X-Accepted-GitHub-Permissions="pull_requests=write"', ln)
+        self.assertIn('X-OAuth-Scopes=""', ln)
+        self.assertIn("X-Accepted-OAuth-Scopes=absent", ln)  # нет заголовка — не догадка
+        self.assertIn('body={"message":"Resource not accessible by integration",', ln)
+        self.assertNotIn("tok", ln.split(" body=")[0].replace("token=", ""))  # значение токена не печатается
+
+    def test_comment_refusal_without_headers_says_absent(self):
+        self.w.comment_status = 403
+        _, out = self.review_printed()
+        ln = next(ln for ln in out.splitlines() if ln.startswith("COMMENT_POST_REFUSED "))
+        for h in ("X-Accepted-GitHub-Permissions", "X-OAuth-Scopes", "X-Accepted-OAuth-Scopes"):
+            self.assertIn(f"{h}=absent", ln)
+
+    def test_comment_refusal_body_tokens_redacted(self):
+        self.w.comment_status = 403
+        self.w.comment_body = b'{"message":"bad ghs_abcdefghijklmnop1234"}'
+        _, out = self.review_printed()
+        self.assertNotIn("ghs_abcdef", out)
+
+    def test_comment_refusal_is_not_a_refusal_probe(self):
+        # Отказ публикации и проба-отказ — разные строки: сводка не примет одно за другое.
+        import digest_lib
+        self.w.comment_status = 403
+        _, out = self.review_printed()
+        refusal = "\n".join(ln for ln in out.splitlines() if ln.startswith("COMMENT_POST_REFUSED"))
+        self.assertTrue(refusal)
+        self.assertEqual(digest_lib.refusals_of(refusal), [])
+
+    def test_success_prints_no_refusal(self):
+        _, out = self.review_printed()
+        self.assertNotIn("COMMENT_POST_REFUSED", out)
+
+    def test_probe_token_scope_matches_workflow(self):
+        wf = open(os.path.join(HERE, "..", "..", "workflows", "reviewer.yml"), encoding="utf-8").read()
+        block = wf[wf.index("Mint reviewer token (probe"):wf.index("- name: Review\n")]
+        perms = sorted(re.findall(r"permission-([a-z-]+): (\w+)", block))
+        self.assertEqual(rv.PROBE_TOKEN_SCOPE, "probe: " + ", ".join(f"{k}:{v}" for k, v in perms))
 
     def test_head_moved(self):
         self.assertEqual(self.review(head="f" * 40)["result"], "UNKNOWN(head_moved)")

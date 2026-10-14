@@ -81,6 +81,8 @@ class World:
         self.p1_status = 403
         self.p2_status = 403
         self.comment_status = 201
+        self.comment_headers = {}
+        self.comment_body = b"{}"
         self.posted = []
         self.deleted = []
         self.calls = []
@@ -145,7 +147,7 @@ class World:
             return self._page(path, self.comments.get(int(m.group(1)), []), None)
         if m and method == "POST":
             if self.comment_status != 201:
-                return self.comment_status, {}, b"{}"
+                return self.comment_status, self.comment_headers, self.comment_body
             self.posted.append((int(m.group(1)), json.loads(body)["body"]))
             return 201, {}, b'{"id": 1}'
         if method == "POST" and re.fullmatch(rf"/repos/{KR}/issues/\d+/comments", path_only):

@@ -23,6 +23,9 @@ import openai_checks as oc  # noqa: E402
 import reviewer_lib as rl  # noqa: E402
 
 API = "https://api.github.com"
+# Область токена публикации, как она выпускается в reviewer.yml (шаг «Mint reviewer
+# token (probe, …)»): печатается рядом с отказом, сверку держит тест.
+PROBE_TOKEN_SCOPE = "probe: issues:write, pull-requests:read"
 EXPECTED_MODELS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expected-models.json")
 REVIEW_MAX_OUTPUT_TOKENS = 16000
 
@@ -244,8 +247,12 @@ def review(ctx):
             st["canary"] = "PASS"
 
         body = rl.format_comment(findings, prompt_sha, oc.REVIEW_MODEL, head_sha, ctx["run_id"], ctx["trigger"], format_sha)
-        status, _, _ = gh_probe.request("POST", f"/repos/{repo}/issues/{pr}/comments", {"body": body})
+        path = f"/repos/{repo}/issues/{pr}/comments"
+        status, headers, answer = gh_probe.request("POST", path, {"body": body})
         if status != 201:
+            # Ответ площадки целиком — в журнал (D-146 §d): какое право она ожидала,
+            # называет она сама. Права здесь не меняются.
+            print(rl.comment_refusal_line("POST", path, "GH_TOKEN_PROBE", PROBE_TOKEN_SCOPE, status, headers, answer))
             raise rl.Unknown(f"comment_post:{status}")
         st["result"] = rl.DONE
     except rl.Unknown as exc:
