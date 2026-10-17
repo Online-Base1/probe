@@ -1,0 +1,57 @@
+# Фикстура частичной пробы Stop (§18′ п.10a/10b, D-159, D-163 §e). НЕ ВЛИВАТЬ:
+# живёт только на ветке stop-probe/fixture и запускается push-ем в неё.
+#
+# Каждые H=30 с две строки во внешний сток — задачу probe#55, которая
+# переживает смерть машины:
+#   signal=heartbeat — GITHUB_TOKEN (github-actions[bot]): процесс жив;
+#   signal=access    — токен приложения ревьюера из create-github-app-token
+#                      (online-base1-reviewer[bot]): доступ действует.
+# Обе несут stop_probe_run_id, порядковый номер и время. Прогон живёт, пока
+# его не отменят; timeout-minutes — потолок на случай, если отмена не дошла.
+# Токены не печатаются. Расход у поставщика (10c) здесь не проверяется.
+name: stop-probe
+
+on:
+  push:
+    branches: [stop-probe/fixture]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Mint app token (probe, issues:write)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-issues: write
+
+      - name: Heartbeat and access every 30 s until cancelled
+        env:
+          GH_ACTIONS_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app.outputs.token }}
+          SINK: https://api.github.com/repos/${{ github.repository }}/issues/55/comments
+          RUN_ID: ${{ github.run_id }}
+          H: "30"
+        run: |
+          post() {  # $1 = токен, $2 = текст; печатается только HTTP-статус
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$SINK" \
+              -H "Authorization: Bearer $1" -H "Accept: application/vnd.github+json" \
+              -d "$(jq -n --arg b "$2" '{body: $b}')")
+            echo "$(date -u +%FT%TZ) $3 -> HTTP $code"
+          }
+          n=0
+          while true; do
+            n=$((n + 1))
+            t=$(date -u +%FT%TZ)
+            post "$GH_ACTIONS_TOKEN" "stop_probe_run_id=$RUN_ID seq=$n t=$t signal=heartbeat" "heartbeat seq=$n"
+            post "$APP_TOKEN" "stop_probe_run_id=$RUN_ID seq=$n t=$t signal=access" "access seq=$n"
+            sleep "$H"
+          done
