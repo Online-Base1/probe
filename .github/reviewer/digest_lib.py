@@ -38,6 +38,8 @@ import reviewer_lib as rl
 # Ни один процесс по этой issue не запускается (условие D-104; тест
 # test_no_issue_triggers держит его для probe).
 DIGEST_ISSUE = 12
+# Задача-журнал находок ревьюера — probe#50 (D-147 §d); константа живёт в reviewer_lib.
+FINDINGS_ISSUE = rl.FINDINGS_ISSUE
 
 PROBE_REPO = "Online-Base1/probe"
 ONLINE_BASE_REPO = "Online-Base1/online-base"
