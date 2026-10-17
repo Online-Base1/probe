@@ -11,7 +11,10 @@ D-102 (снимок задания, исходы, доступ к промпту
   AGENT_RUN_INCOMPLETE(<c>)  — прогон агента не завершён, ревью не делается;
                                красный, если заявка у прогона уже есть (BB-43);
   UNKNOWN(<причина>)         — судить не по чему; красный. В т.ч. повтор
-                               ключа в ответе (response_duplicate_key, BB-45).
+                               ключа в ответе (response_duplicate_key, BB-45)
+                               и пустой список находок без свежего
+                               положительного контроля (stale_positive_control,
+                               BB-44).
 
 Всё, что приходит из сети, передаётся сюда уже полученным: так каждая проверка
 гоняется на подделках (tests/test_reviewer_lib.py, tests/test_reviewer_flow.py).
@@ -246,6 +249,52 @@ def already_reviewed(comments, head_sha, canary_run_id=None):
     marker = done_marker(head_sha, canary_run_id)
     return any((c.get("user") or {}).get("login") == REVIEWER_LOGIN and marker in (c.get("body") or "")
                for c in comments)
+
+
+# Срок свежести положительного контроля (BB-44), часы; число в конфиге, как
+# срок в D-145 §e. Канарейка ночная (canary-trigger.yml, cron раз в сутки):
+# период × 2 — одна пропущенная или упавшая ночь прогоны агента не красит,
+# две подряд красят. Меняется заявкой, не настройкой.
+POSITIVE_CONTROL_WINDOW_HOURS = 48
+
+# Комментарий канарейки «ревью проведено» публикуется, только если она нашла
+# заложенный дефект: canary_missed поднимается раньше публикации.
+_CANARY_DONE_RE = re.compile(r"<!-- factory-reviewer: done head_sha=[0-9a-f]{40} canary_run_id=\d+ -->")
+
+
+def last_positive_control(comments):
+    """Время (UTC, naive) последнего успешного контроля в журнале или None.
+
+    Засчитывается только комментарий самого ревьюера с маркером канарейки:
+    строку от кого-то другого не засчитываем, как и в already_reviewed.
+    """
+    latest = None
+    for c in comments:
+        if (c.get("user") or {}).get("login") != REVIEWER_LOGIN:
+            continue
+        if not _CANARY_DONE_RE.search(c.get("body") or ""):
+            continue
+        try:
+            at = datetime.datetime.strptime(c.get("created_at") or "", "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+        if latest is None or at > latest:
+            latest = at
+    return latest
+
+
+def check_positive_control(findings, last_control, now):
+    """Пустой список находок — DONE, только если контроль свежий (BB-44).
+
+    «Находок нет» что-то доказывает, лишь пока модель недавно нашла
+    заложенный дефект. Нет успешного контроля в окне — включая «не было
+    никогда» — UNKNOWN(stale_positive_control). Вызовов модели не добавляет.
+    """
+    if findings:
+        return
+    window = datetime.timedelta(hours=POSITIVE_CONTROL_WINDOW_HOURS)
+    if last_control is None or now - last_control > window:
+        raise Unknown("stale_positive_control")
 
 
 # Положительная контрольная механики извлечения отказов (§18′ п.18, D-143 §f):

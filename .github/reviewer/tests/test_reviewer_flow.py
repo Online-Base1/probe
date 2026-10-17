@@ -21,6 +21,17 @@ import reviewer_lib as rl  # noqa: E402
 EXPECTED = os.path.join(HERE, "..", "expected-models.json")
 CANARY_PR = 34  # не совпадает с FINDINGS_ISSUE: публикация в журнал отличима от публикации в заявку
 PROBE_ISSUE = 42
+# Часы ревью и свежий положительный контроль по умолчанию (BB-44): канарейка
+# нашла дефект этой ночью — пустой список находок на прогоне агента — DONE.
+REVIEW_NOW = datetime.datetime(2026, 9, 29, 12, 0, 0)
+
+
+def control_comment(created_at, login=None, run_id="899001"):
+    return {"user": {"login": login or rl.REVIEWER_LOGIN}, "created_at": created_at,
+            "body": rl.done_marker("d" * 40, run_id) + "\nНаходок: 1."}
+
+
+FRESH_CONTROL = control_comment("2026-09-29T03:20:00Z")
 
 
 class Base(unittest.TestCase):
@@ -31,6 +42,7 @@ class Base(unittest.TestCase):
         self.w.prs.append(F.World.agent_pr(CANARY_PR, sha="d" * 40, ref="canary/known-defect", base="canary-base"))
         self.w.commit_dates["d" * 40] = "2026-01-01T00:00:00Z"
         self.w.comments[CANARY_PR] = []
+        self.w.comments[rl.FINDINGS_ISSUE] = [FRESH_CONTROL]
 
     def tearDown(self):
         rl.CANARY_PR, rl.WRITE_PROBE_ISSUE = self._saved
@@ -45,7 +57,7 @@ class Base(unittest.TestCase):
         self.client = client or F.FakeOpenAI()
         self.ctx = {"repo": F.REPO, "pr": str(pr), "head_sha": head, "run_id": str(F.RUN_ID), "trigger": trigger,
                     "gh_read": self.gh(), "gh_probe": self.gh(), "gh_knowledge": self.gh(),
-                    "openai_factory": lambda: self.client, "expected_models": EXPECTED}
+                    "openai_factory": lambda: self.client, "expected_models": EXPECTED, "now": REVIEW_NOW}
         return rv.review(self.ctx)
 
 
@@ -182,6 +194,69 @@ class Review(Base):
             rl.parse_response(text, F.SCHEMA)
         self.assertEqual(cm.exception.reason, "response_duplicate_key")
 
+    # --- BB-44: срок свежести положительного контроля ---
+
+    def review_empty(self, comments):
+        self.w.comments[rl.FINDINGS_ISSUE] = comments
+        return self.review(F.FakeOpenAI(review_text=json.dumps({"findings": []})))
+
+    def test_empty_findings_fresh_control_done(self):
+        st = self.review_empty([FRESH_CONTROL])
+        self.assertEqual((st["result"], st["findings"]), ("DONE", 0))
+        (_, body), = self.w.posted
+        self.assertIn("Находок нет", body)
+
+    def test_empty_findings_stale_control_unknown(self):
+        st = self.review_empty([control_comment("2026-09-26T03:20:00Z")])
+        self.assertEqual(st["result"], "UNKNOWN(stale_positive_control)")
+        self.assertEqual(self.w.posted, [])
+
+    def test_empty_findings_never_controlled_unknown(self):
+        st = self.review_empty([])
+        self.assertEqual(st["result"], "UNKNOWN(stale_positive_control)")
+        self.assertEqual(self.w.posted, [])
+
+    def test_window_boundary(self):
+        edge = REVIEW_NOW - datetime.timedelta(hours=rl.POSITIVE_CONTROL_WINDOW_HOURS)
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        self.assertEqual(self.review_empty([control_comment(edge.strftime(fmt))])["result"], "DONE")
+        self.w.posted.clear()
+        late = edge - datetime.timedelta(seconds=1)
+        self.assertEqual(self.review_empty([control_comment(late.strftime(fmt))])["result"],
+                         "UNKNOWN(stale_positive_control)")
+
+    def test_window_is_48_hours(self):
+        self.assertEqual(rl.POSITIVE_CONTROL_WINDOW_HOURS, 48)
+
+    def test_latest_control_counts(self):
+        st = self.review_empty([control_comment("2026-09-20T03:20:00Z"), FRESH_CONTROL,
+                                control_comment("2026-09-21T03:20:00Z")])
+        self.assertEqual(st["result"], "DONE")
+
+    def test_control_by_other_login_not_counted(self):
+        st = self.review_empty([control_comment("2026-09-29T03:20:00Z", login=rl.WORKER_LOGIN)])
+        self.assertEqual(st["result"], "UNKNOWN(stale_positive_control)")
+
+    def test_agent_done_marker_is_not_a_control(self):
+        st = self.review_empty([{"user": {"login": rl.REVIEWER_LOGIN}, "created_at": "2026-09-29T11:00:00Z",
+                                 "body": rl.done_marker("e" * 40)}])
+        self.assertEqual(st["result"], "UNKNOWN(stale_positive_control)")
+
+    def test_control_without_time_not_counted(self):
+        bad = dict(FRESH_CONTROL, created_at="yesterday")
+        self.assertEqual(self.review_empty([bad])["result"], "UNKNOWN(stale_positive_control)")
+
+    def test_findings_present_need_no_control(self):
+        self.w.comments[rl.FINDINGS_ISSUE] = []
+        text = json.dumps({"findings": [{"file": "lib/x.ts", "line": 1, "message": "m"}]})
+        self.assertEqual(self.review(F.FakeOpenAI(review_text=text))["result"], "DONE")
+
+    def test_control_costs_no_model_call(self):
+        client = F.FakeOpenAI(review_text=json.dumps({"findings": []}))
+        self.w.comments[rl.FINDINGS_ISSUE] = []
+        self.review(client)
+        self.assertEqual(sum(1 for r in client.requests if "instructions" in r), 1)
+
     def test_published_to_journal_with_pr_link_head_run_and_findings(self):
         text = json.dumps({"findings": [{"file": "lib/x.ts", "line": 2, "severity": "major", "message": "off by one",
                                          "failure_scenario": "x=10 → 9 pages instead of 10"}]})
@@ -242,14 +317,14 @@ class Review(Base):
         self.assertEqual(self.review()["result"], "UNKNOWN(task_not_utf8)")
 
     def test_already_reviewed(self):
-        self.w.comments[rl.FINDINGS_ISSUE] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker(F.HEAD)}]
+        self.w.comments[rl.FINDINGS_ISSUE].append({"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker(F.HEAD)})
         st = self.review()
         self.assertTrue(st["skipped"])
         self.assertEqual(self.client.requests, [])
         self.assertEqual(self.w.posted, [])
 
     def test_marker_by_other_user_ignored(self):
-        self.w.comments[rl.FINDINGS_ISSUE] = [{"user": {"login": rl.WORKER_LOGIN}, "body": rl.done_marker(F.HEAD)}]
+        self.w.comments[rl.FINDINGS_ISSUE].append({"user": {"login": rl.WORKER_LOGIN}, "body": rl.done_marker(F.HEAD)})
         st = self.review()
         self.assertFalse(st["skipped"])
         self.assertEqual(st["result"], "DONE")
