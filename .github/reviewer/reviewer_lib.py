@@ -9,7 +9,9 @@ D-102 (снимок задания, исходы, доступ к промпту
 Исходы прогона ревьюера:
   DONE                       — ревью состоялось (о качестве кода это не говорит);
   AGENT_RUN_INCOMPLETE(<c>)  — прогон агента не завершён, ревью не делается;
-  UNKNOWN(<причина>)         — судить не по чему; красный.
+                               красный, если заявка у прогона уже есть (BB-43);
+  UNKNOWN(<причина>)         — судить не по чему; красный. В т.ч. повтор
+                               ключа в ответе (response_duplicate_key, BB-45).
 
 Всё, что приходит из сети, передаётся сюда уже полученным: так каждая проверка
 гоняется на подделках (tests/test_reviewer_lib.py, tests/test_reviewer_flow.py).
@@ -402,9 +404,20 @@ def validate(value, schema, path="$"):
                 validate(v, props[k], f"{path}.{k}")
 
 
+def _reject_duplicate_keys(pairs):
+    # json.loads по умолчанию молча берёт последний из повторов: {"findings": [..],
+    # "findings": []} читалось бы как «находок нет» (BB-45). Повтор — отказ.
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise Unknown("response_duplicate_key")
+        out[k] = v
+    return out
+
+
 def parse_response(text, schema):
     try:
-        value = json.loads(text)
+        value = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
     except (TypeError, ValueError):
         raise Unknown("response_not_json")
     validate(value, schema)
