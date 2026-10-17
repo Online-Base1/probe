@@ -112,6 +112,16 @@ def fetch_task(gh, repo, run_id):
     return art, data
 
 
+def agent_pr(gh, repo, wr):
+    """Заявка бота-исполнителя в окне прогона wr: (номер, head_sha) или None."""
+    prs = gh.paginate(f"/repos/{repo}/pulls?state=open", "pulls")
+
+    def commit_date(sha):
+        return gh.json(f"/repos/{repo}/commits/{sha}", "commit")["commit"]["committer"]["date"]
+
+    return rl.select_agent_pr(prs, commit_date, repo, wr["run_started_at"], wr["updated_at"])
+
+
 def resolve(event, gh, repo):
     wr = event["workflow_run"]
     # run_id — только из события (D-101 §c), не из содержимого артефакта.
@@ -123,13 +133,7 @@ def resolve(event, gh, repo):
         art, _ = fetch_task(gh, repo, wr["id"])
         out["task_artifact"] = art["name"]
         if trigger == "agent":
-            prs = gh.paginate(f"/repos/{repo}/pulls?state=open", "pulls")
-
-            def commit_date(sha):
-                return gh.json(f"/repos/{repo}/commits/{sha}", "commit")["commit"]["committer"]["date"]
-
-            found = rl.select_agent_pr(prs, commit_date, repo, wr["run_started_at"], wr["updated_at"])
-            pr, sha = rl.pr_for_agent_run(wr.get("conclusion"), found)
+            pr, sha = rl.pr_for_agent_run(wr.get("conclusion"), agent_pr(gh, repo, wr))
         else:
             if rl.CANARY_PR is None:
                 raise rl.Unknown("canary_pr_not_configured")
@@ -137,6 +141,17 @@ def resolve(event, gh, repo):
         out.update(outcome=rl.REVIEW, pr=str(pr), head_sha=sha)
     except rl.Incomplete as exc:
         out.update(outcome=rl.INCOMPLETE, reason=exc.conclusion)
+        if out["trigger"] == "agent" and not out["pr"] and exc.conclusion != "failure":
+            # Заявка у незавершённого прогона ищется тем же окном (BB-43): есть
+            # заявка — ревью не проведено, и итог прогона будет красным.
+            # failure без заявки уже прошёл этот поиск в pr_for_agent_run.
+            try:
+                found = agent_pr(gh, repo, wr)
+            except rl.Unknown as uexc:
+                out.update(outcome=rl.UNKNOWN_KIND, reason=uexc.reason)
+            else:
+                if found:
+                    out.update(pr=str(found[0]), head_sha=found[1])
     except rl.Unknown as exc:
         out.update(outcome=rl.UNKNOWN_KIND, reason=exc.reason)
     return out
@@ -335,7 +350,12 @@ def report(env, gh=None, now=None):
     lines = rl.summary_lines(result, findings, prompt_sha, model, canary, kind=trigger,
                              pr=env.get("RESOLVE_PR", ""), head_sha=env.get("RESOLVE_HEAD_SHA", ""),
                              format_sha=format_sha, run_date=now.date().isoformat(), retention=retention)
-    red = result.startswith(rl.UNKNOWN_KIND) or canary == "FAIL" or retention == rl.RETENTION_FAILED
+    # Прогон агента не завершён, а заявка уже есть — ревью не проведено; это
+    # не зелёный (BB-43). Без заявки ревьюить нечего — поведение прежнее.
+    unreviewed = outcome == rl.INCOMPLETE and bool(env.get("RESOLVE_PR", ""))
+    if unreviewed:
+        print(f"::error::agent run incomplete ({reason}) but PR #{env['RESOLVE_PR']} exists: review not done")
+    red = result.startswith(rl.UNKNOWN_KIND) or canary == "FAIL" or retention == rl.RETENTION_FAILED or unreviewed
     return lines, 1 if red else 0
 
 

@@ -119,6 +119,28 @@ class Resolve(Base):
             out = self.resolve(conclusion=c)
             self.assertEqual((out["outcome"], out["reason"]), ("AGENT_RUN_INCOMPLETE", c))
 
+    def test_cancelled_with_pr_reports_pr(self):
+        # BB-43: заявка у незавершённого прогона находится — по ней report краснеет.
+        out = self.resolve(conclusion="cancelled")
+        self.assertEqual((out["outcome"], out["pr"], out["head_sha"]), ("AGENT_RUN_INCOMPLETE", "7", F.HEAD))
+        self.assertEqual(self.w.posted, [])
+
+    def test_cancelled_without_pr_has_no_pr(self):
+        self.w.prs = []
+        out = self.resolve(conclusion="cancelled")
+        self.assertEqual((out["outcome"], out["reason"], out["pr"]), ("AGENT_RUN_INCOMPLETE", "cancelled", ""))
+
+    def test_cancelled_needs_no_task_artifact(self):
+        # Отменённый прогон мог не успеть выложить задание — это по-прежнему не UNKNOWN.
+        self.w.artifacts = []
+        out = self.resolve(conclusion="cancelled")
+        self.assertEqual((out["outcome"], out["pr"]), ("AGENT_RUN_INCOMPLETE", "7"))
+
+    def test_failure_without_pr_lists_prs_once(self):
+        self.w.prs = []
+        self.resolve(conclusion="failure")
+        self.assertEqual(sum(1 for m, u in self.w.calls if "/pulls?" in u), 1)
+
     def test_unexpected_workflow(self):
         self.assertTrue(self.resolve(path=".github/workflows/ci.yml")["reason"].startswith("unexpected_workflow"))
 
@@ -145,6 +167,20 @@ class Review(Base):
         self.assertIn("Находок нет", body)
         self.assertIn(F.PROMPT_SHA, body)
         self.assertIn(F.FORMAT_SHA, body)
+
+    def test_duplicate_findings_key_refused(self):
+        # BB-45: первый "findings" непустой, второй [] — не «находок нет», а отказ.
+        text = ('{"findings": [{"file": "lib/x.ts", "line": 1, "message": "real defect"}], '
+                '"findings": []}')
+        st = self.review(F.FakeOpenAI(review_text=text))
+        self.assertEqual(st["result"], "UNKNOWN(response_duplicate_key)")
+        self.assertEqual(self.w.posted, [])
+
+    def test_duplicate_nested_key_refused(self):
+        text = '{"findings": [{"file": "lib/x.ts", "file": "lib/y.ts", "line": 1, "message": "m"}]}'
+        with self.assertRaises(rl.Unknown) as cm:
+            rl.parse_response(text, F.SCHEMA)
+        self.assertEqual(cm.exception.reason, "response_duplicate_key")
 
     def test_published_to_journal_with_pr_link_head_run_and_findings(self):
         text = json.dumps({"findings": [{"file": "lib/x.ts", "line": 2, "severity": "major", "message": "off by one",
@@ -485,6 +521,18 @@ class Report(unittest.TestCase):
     def test_incomplete_not_red(self):
         lines, code = self.run_report(RESOLVE_OUTCOME="AGENT_RUN_INCOMPLETE", RESOLVE_REASON="cancelled")
         self.assertEqual((lines[0], code), ("REVIEW_RESULT=AGENT_RUN_INCOMPLETE(cancelled)", 0))
+
+    def test_incomplete_with_pr_is_red(self):
+        # BB-43: заявка у прогона есть, ревью не проведено — не зелёный.
+        lines, code = self.run_report(RESOLVE_OUTCOME="AGENT_RUN_INCOMPLETE", RESOLVE_REASON="cancelled",
+                                      RESOLVE_TRIGGER="agent", RESOLVE_PR="7", RESOLVE_HEAD_SHA=F.HEAD)
+        self.assertEqual((lines[0], code), ("REVIEW_RESULT=AGENT_RUN_INCOMPLETE(cancelled)", 1))
+
+    def test_incomplete_without_pr_stays_green(self):
+        # Заявки нет — ревьюить нечего, поведение прежнее.
+        lines, code = self.run_report(RESOLVE_OUTCOME="AGENT_RUN_INCOMPLETE", RESOLVE_REASON="failure",
+                                      RESOLVE_TRIGGER="agent", RESOLVE_PR="")
+        self.assertEqual((lines[0], code), ("REVIEW_RESULT=AGENT_RUN_INCOMPLETE(failure)", 0))
 
     def test_unknown_red(self):
         lines, code = self.run_report(RESOLVE_OUTCOME="UNKNOWN", RESOLVE_REASON="no_task_artifact")
