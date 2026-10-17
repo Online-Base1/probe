@@ -2,7 +2,7 @@
   "schema": 1,
   "runner_label": "ubuntu-24.04",
   "image_os": "ubuntu24",
-  "image_version": "20261004.327.1",
+  "image_version": "20261012.334.1",
   "python3": "3.12.3",
   "claude_code_version": "2.1.283",
   "uses": {
@@ -21,10 +21,10 @@
   ],
   "observed_in": {
     "runner_label": "38343423923 (reviewer-ci, 2026-10-13): Set up job — Image: ubuntu-24.04",
-    "image_os": "38343423923: ImageOS=ubuntu24",
-    "image_version": "38343423923: ImageVersion=20261004.327.1 = /imagegeneration/imagedata.json",
-    "python3": "38343423923: /usr/bin/python3 — Python 3.12.3",
-    "claude_code_version": "36468629520 (agent, 2026-09-28, образ 20260920.314.1): claude --version: 2.1.283 (Claude Code)",
+    "image_os": "39042342444, 38927848294, 38766429803 (digest, 15–17.10, артефакт env-check): ImageOS=ubuntu24 — без изменений",
+    "image_version": "39042342444, 38927848294, 38766429803 (digest, 15–17.10, артефакт env-check): ImageVersion=20261012.334.1; было 20261004.327.1 (38343423923, reviewer-ci, 13.10)",
+    "python3": "39042342444, 38927848294, 38766429803 (digest, 15–17.10, артефакт env-check): python3 3.12.3 — без изменений",
+    "claude_code_version": "36468629520 (agent, 2026-09-28, образ 20260920.314.1): claude --version: 2.1.283 (Claude Code); в образе 20261012.334.1 не наблюдалась — агент в нём не запускался",
     "actions/checkout": "38294179341 (digest), 36468629520 (agent): Download action repository … (SHA:3d3c42e…)",
     "actions/create-github-app-token": "38294179341 (digest), 38239984832 (canary-trigger), 36468629520 (agent)",
     "actions/upload-artifact": "38239984832 (canary-trigger), 36468629520 (agent)",
