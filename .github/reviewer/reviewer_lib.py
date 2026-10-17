@@ -46,6 +46,12 @@ CANARY_WORKFLOW_PATH = ".github/workflows/canary-trigger.yml"
 # определяется ТОЛЬКО этим номером и прогоном canary-trigger.yml (D-105 §a.1):
 # ни тело, ни ветка, ни метка заявки её не делают канарейкой.
 CANARY_PR = 34
+
+# Задача-журнал находок ревьюера в probe (#50, D-147 §d). Комментарий к заявке
+# требует pull_requests:write — оно даёт и одобрять заявки и погасило бы пробу
+# p2_canary_approve (D-147 §c). Для задачи достаточно issues:write. Рядом —
+# DIGEST_ISSUE сводки (digest_lib).
+FINDINGS_ISSUE = 50
 CANARY_BRANCH = "canary/known-defect"
 CANARY_BASE = "canary-base"  # невливаемость базой, а не меткой (D-105 §b)
 WRITE_PROBE_ISSUE = 3
@@ -460,9 +466,14 @@ def clean(text, limit=500):
     return text[:limit]
 
 
-def format_comment(findings, prompt_sha, model, head_sha, run_id, trigger, format_sha=""):
+def format_comment(findings, prompt_sha, model, head_sha, run_id, trigger, format_sha="", repo="", pr=""):
+    """Комментарий в задачу-журнал FINDINGS_ISSUE (D-147 §d): ссылка на заявку,
+    head_sha, число находок, находки по standards/findings-format.md, run_id."""
+    link = f"https://github.com/{repo}/pull/{pr}" if repo and pr else f"#{pr}"
     lines = [done_marker(head_sha, run_id if trigger == "canary" else None),
-             f"### Ревью другим семейством (прогон агента {run_id})",
+             f"### Ревью другим семейством: заявка {link}",
+             "",
+             f"Прогон {'канарейки' if trigger == 'canary' else 'агента'} `{run_id}` · head_sha `{head_sha}`",
              "",
              "Неблокирующее. Модель не видит описания заявки, заголовка и сообщений коммитов (D-091 §b).",
              ""]
@@ -473,11 +484,18 @@ def format_comment(findings, prompt_sha, model, head_sha, run_id, trigger, forma
         lines.append("")
         for f in findings:
             where = clean(f"{f.get('file')}:{f.get('line')}", 200).replace("`", "′")
-            lines.append(f"- `{where}`")
-            text = f.get("message") or f.get("summary") or f.get("title") or ""
-            if text:
+            severity = clean(str(f.get("severity") or ""), 40).replace("`", "′")
+            lines.append(f"- `{where}`" + (f" — **{severity}**" if severity else ""))
+            # Поля формата находки (standards/findings-format.md): message и
+            # failure_scenario — каждое своим блоком; старые имена — на случай другой схемы.
+            for label, text in (("", f.get("message") or f.get("summary") or f.get("title") or ""),
+                                ("Сценарий отказа", f.get("failure_scenario") or "")):
+                if not text:
+                    continue
+                if label:
+                    lines.append(f"  {label}:")
                 lines.append("  ```text")
-                lines.extend("  " + ln for ln in clean(text, 1500).split("\n"))
+                lines.extend("  " + ln for ln in clean(text, 2000).split("\n"))
                 lines.append("  ```")
     lines += ["",
               f"_head_sha `{head_sha}` · MODEL `{model}` · PROMPT_SHA `{prompt_sha}` · FORMAT_SHA `{format_sha}` · trigger `{trigger}`_"]

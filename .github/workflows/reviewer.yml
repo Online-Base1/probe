@@ -2,7 +2,9 @@
 #
 # Запускается только с main по workflow_run прогонов agent.yml и ночной
 # канарейки canary-trigger.yml. Вывод неблокирующий: ревьюер не required
-# check, он пишет комментарий в заявку и строку REVIEW_RESULT в summary.
+# check, он пишет комментарий в задачу-журнал probe#50 (FINDINGS_ISSUE, D-147 §d:
+# не в заявку — для неё площадка требует pull_requests:write) и строку
+# REVIEW_RESULT в summary.
 #
 #   resolve — run_id только из события; ровно один артефакт agent-task-<sha256>,
 #             хеш его байтов == суффиксу; заявка агента — ровно одна по автору,
@@ -16,7 +18,8 @@
 #             промпт prompts/05-review.md и формат standards/findings-format.md
 #             с main factory-knowledge (D-104 §h), запрос по белому списку
 #             (задание, дифф, статусы гейтов — без body, title и сообщений
-#             коммитов), ответ по схеме, usage > 0, комментарий с маркером head_sha.
+#             коммитов), ответ по схеме, usage > 0, комментарий с маркером head_sha
+#             в задачу-журнал FINDINGS_ISSUE (ссылка на заявку, run_id, находки).
 #   report  — REVIEW_RESULT=DONE|AGENT_RUN_INCOMPLETE(..)|UNKNOWN(..), FINDINGS,
 #             PROMPT_SHA, FORMAT_SHA, MODEL, CANARY, RETENTION и строка учёта
 #             REVIEW_LEDGER фиксированного вида — в сводку и в журнал (D-106 §e,

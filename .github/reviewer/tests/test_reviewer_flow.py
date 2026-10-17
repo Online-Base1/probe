@@ -19,7 +19,7 @@ import reviewer as rv  # noqa: E402
 import reviewer_lib as rl  # noqa: E402
 
 EXPECTED = os.path.join(HERE, "..", "expected-models.json")
-CANARY_PR = 50
+CANARY_PR = 34  # не совпадает с FINDINGS_ISSUE: публикация в журнал отличима от публикации в заявку
 PROBE_ISSUE = 42
 
 
@@ -124,7 +124,7 @@ class Resolve(Base):
 
     def test_canary_trigger(self):
         out = self.resolve(path=".github/workflows/canary-trigger.yml")
-        self.assertEqual((out["outcome"], out["pr"], out["trigger"]), ("REVIEW", "50", "canary"))
+        self.assertEqual((out["outcome"], out["pr"], out["trigger"]), ("REVIEW", str(CANARY_PR), "canary"))
 
     def test_canary_wrong_base(self):
         self.w.prs[-1]["base"]["ref"] = "main"
@@ -139,12 +139,42 @@ class Review(Base):
     def test_done_zero_findings(self):
         st = self.review()
         self.assertEqual((st["result"], st["findings"], st["prompt_sha"], st["format_sha"]), ("DONE", 0, F.PROMPT_SHA, F.FORMAT_SHA))
-        (pr, body), = self.w.posted
-        self.assertEqual(pr, 7)
+        (issue, body), = self.w.posted
+        self.assertEqual(issue, rl.FINDINGS_ISSUE)  # в задачу-журнал, не в заявку №7 (D-147 §d)
         self.assertIn(rl.done_marker(F.HEAD), body)
         self.assertIn("Находок нет", body)
         self.assertIn(F.PROMPT_SHA, body)
         self.assertIn(F.FORMAT_SHA, body)
+
+    def test_published_to_journal_with_pr_link_head_run_and_findings(self):
+        text = json.dumps({"findings": [{"file": "lib/x.ts", "line": 2, "severity": "major", "message": "off by one",
+                                         "failure_scenario": "x=10 → 9 pages instead of 10"}]})
+        st = self.review(F.FakeOpenAI(review_text=text))
+        self.assertEqual(st["result"], "DONE")
+        (issue, body), = self.w.posted
+        self.assertEqual(issue, rl.FINDINGS_ISSUE)
+        self.assertNotIn(7, [n for n, _ in self.w.posted])
+        self.assertIn(f"https://github.com/{F.REPO}/pull/7", body)
+        # Шапка комментария несёт прогон и head_sha вместе — по ней журнал читается без подвала.
+        self.assertIn(f"Прогон агента `{F.RUN_ID}` · head_sha `{F.HEAD}`", body.split("\n"))
+        self.assertIn("**Находок: 1.**", body)
+        self.assertIn("- `lib/x.ts:2` — **major**", body)
+        self.assertIn("off by one", body)
+        self.assertIn("Сценарий отказа:", body)
+        self.assertIn("x=10 → 9 pages instead of 10", body)
+
+    def test_dedup_key_read_from_journal_not_pr(self):
+        # Маркер в самой заявке больше не выключает ревью: ключ живёт в журнале.
+        self.w.comments[7] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker(F.HEAD)}]
+        st = self.review()
+        self.assertFalse(st["skipped"])
+        reads = [u for m, u in self.w.calls if m == "GET" and "/comments" in u]
+        self.assertTrue(reads and all(f"/issues/{rl.FINDINGS_ISSUE}/comments" in u for u in reads), reads)
+
+    def test_findings_issue_differs_from_canary_and_digest(self):
+        import digest_lib
+        self.assertNotEqual(rl.FINDINGS_ISSUE, rl.CANARY_PR)
+        self.assertEqual(digest_lib.FINDINGS_ISSUE, rl.FINDINGS_ISSUE)
 
     def test_instructions_carry_prompt_and_format(self):
         self.review()
@@ -176,14 +206,14 @@ class Review(Base):
         self.assertEqual(self.review()["result"], "UNKNOWN(task_not_utf8)")
 
     def test_already_reviewed(self):
-        self.w.comments[7] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker(F.HEAD)}]
+        self.w.comments[rl.FINDINGS_ISSUE] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker(F.HEAD)}]
         st = self.review()
         self.assertTrue(st["skipped"])
         self.assertEqual(self.client.requests, [])
         self.assertEqual(self.w.posted, [])
 
     def test_marker_by_other_user_ignored(self):
-        self.w.comments[7] = [{"user": {"login": rl.WORKER_LOGIN}, "body": rl.done_marker(F.HEAD)}]
+        self.w.comments[rl.FINDINGS_ISSUE] = [{"user": {"login": rl.WORKER_LOGIN}, "body": rl.done_marker(F.HEAD)}]
         st = self.review()
         self.assertFalse(st["skipped"])
         self.assertEqual(st["result"], "DONE")
@@ -316,7 +346,7 @@ class Review(Base):
         lines = [ln for ln in out.splitlines() if ln.startswith("COMMENT_POST_REFUSED ")]
         self.assertEqual(len(lines), 1, out)
         ln = lines[0]
-        self.assertIn(f"POST /repos/{F.REPO}/issues/7/comments token=GH_TOKEN_PROBE(probe: issues:write, pull-requests:read) status=403", ln)
+        self.assertIn(f"POST /repos/{F.REPO}/issues/{rl.FINDINGS_ISSUE}/comments token=GH_TOKEN_PROBE(probe: issues:write, pull-requests:read) status=403", ln)
         self.assertIn('X-Accepted-GitHub-Permissions="pull_requests=write"', ln)
         self.assertIn('X-OAuth-Scopes=""', ln)
         self.assertIn("X-Accepted-OAuth-Scopes=absent", ln)  # нет заголовка — не догадка
@@ -378,14 +408,14 @@ class Review(Base):
     def test_canary_reviewed_every_night(self):
         # Вчерашний комментарий того же head_sha, но другого прогона canary-trigger
         # не выключает сегодняшнее ревью (D-105 §a).
-        self.w.comments[CANARY_PR] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker("d" * 40, "899999")}]
+        self.w.comments[rl.FINDINGS_ISSUE] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker("d" * 40, "899999")}]
         text = json.dumps({"findings": [{"file": "lib/paginate.ts", "line": 9, "message": "floor"}]})
         st = self.review(F.FakeOpenAI(review_text=text), trigger="canary", pr=CANARY_PR, head="d" * 40)
         self.assertFalse(st["skipped"])
         self.assertEqual(st["canary"], "PASS")
 
     def test_canary_same_run_skipped(self):
-        self.w.comments[CANARY_PR] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker("d" * 40, str(F.RUN_ID))}]
+        self.w.comments[rl.FINDINGS_ISSUE] = [{"user": {"login": rl.REVIEWER_LOGIN}, "body": rl.done_marker("d" * 40, str(F.RUN_ID))}]
         st = self.review(trigger="canary", pr=CANARY_PR, head="d" * 40)
         self.assertTrue(st["skipped"])
 

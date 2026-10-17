@@ -31,6 +31,9 @@ SCHEMA = {
                     "file": {"type": "string", "minLength": 1},
                     "line": {"type": "integer", "minimum": 1},
                     "message": {"type": "string"},
+                    # поля standards/findings-format.md (там обязательны; здесь — чтобы старые фикстуры оставались валидными)
+                    "severity": {"type": "string", "enum": ["blocker", "major", "minor"]},
+                    "failure_scenario": {"type": "string", "minLength": 1},
                 },
             },
         },

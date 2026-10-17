@@ -202,7 +202,8 @@ def review(ctx):
     repo, pr, head_sha = ctx["repo"], ctx["pr"], ctx["head_sha"]
     gh_read, gh_probe, gh_knowledge = ctx["gh_read"], ctx["gh_probe"], ctx["gh_knowledge"]
     try:
-        comments = gh_read.paginate(f"/repos/{repo}/issues/{pr}/comments", "pr_comments")
+        # Ключ «уже ревьюили» живёт там же, где публикуются находки, — в задаче-журнале.
+        comments = gh_read.paginate(f"/repos/{repo}/issues/{rl.FINDINGS_ISSUE}/comments", "findings_comments")
         canary_run = ctx["run_id"] if ctx["trigger"] == "canary" else None
         if rl.already_reviewed(comments, head_sha, canary_run):
             st.update(result=rl.DONE, skipped=True, canary="n/a" if ctx["trigger"] != "canary" else "PASS")
@@ -246,8 +247,10 @@ def review(ctx):
                 raise rl.Unknown("canary_missed")
             st["canary"] = "PASS"
 
-        body = rl.format_comment(findings, prompt_sha, oc.REVIEW_MODEL, head_sha, ctx["run_id"], ctx["trigger"], format_sha)
-        path = f"/repos/{repo}/issues/{pr}/comments"
+        body = rl.format_comment(findings, prompt_sha, oc.REVIEW_MODEL, head_sha, ctx["run_id"], ctx["trigger"],
+                                 format_sha, repo=repo, pr=pr)
+        # Находки — в задачу-журнал, не в заявку (D-147 §d): права не меняются.
+        path = f"/repos/{repo}/issues/{rl.FINDINGS_ISSUE}/comments"
         status, headers, answer = gh_probe.request("POST", path, {"body": body})
         if status != 201:
             # Ответ площадки целиком — в журнал (D-146 §d): какое право она ожидала,
