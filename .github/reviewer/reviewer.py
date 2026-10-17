@@ -261,6 +261,13 @@ def review(ctx):
             if not rl.canary_found(findings):
                 raise rl.Unknown("canary_missed")
             st["canary"] = "PASS"
+        else:
+            # Положительный контроль — по журналу, без вызова модели (BB-44).
+            now = ctx.get("now") or datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+            last = rl.last_positive_control(comments)
+            print(f"positive control: last canary PASS {last.isoformat() + 'Z' if last else 'never'}, "
+                  f"window {rl.POSITIVE_CONTROL_WINDOW_HOURS}h")
+            rl.check_positive_control(findings, last, now)
 
         body = rl.format_comment(findings, prompt_sha, oc.REVIEW_MODEL, head_sha, ctx["run_id"], ctx["trigger"],
                                  format_sha, repo=repo, pr=pr)
