@@ -1,9 +1,13 @@
 """Автор тестов другого семейства: ввод-вывод вокруг test_author_lib (D-173, D-174).
 
-  test_author.py author — снимок задания → Codex → проверенные файлы тестов.
+  test_author.py author        — снимок задания → Codex → проверенные файлы тестов
+                                 (job test-author в agent.yml);
+  test_author.py materialize   — файлы тестов из артефакта в рабочую копию,
+                                 STUB=1 — и заглушка модуля (job stub-check);
+  test_author.py stub-verdict  — отчёт vitest на заглушке: каждый тест красный;
+  test_author.py slug          — «кратко» для имени ветки (job role).
 
-В конвейер пока НЕ подключён (шаг E, job test-author в agent.yml). Механика —
-ревьюера: GitHub/transport, обмен WIF и проверка границы OpenAI, промпт и
+Механика — ревьюера: GitHub/transport, обмен WIF и проверка границы OpenAI, промпт и
 формат с одного коммита factory-knowledge, разбор с отказом на дубль ключа.
 Своё: сервисный аккаунт автора тестов, его промпт/формат и проверки ответа.
 
@@ -69,10 +73,57 @@ def author(ctx):
     return st
 
 
+def _artifact_value():
+    """Ответ из артефакта agent-tests-<sha256>: хеш и проверки адаптера заново."""
+    with open(os.environ["RESPONSE"], "rb") as fh:
+        data = fh.read()
+    return ta.load_tests_artifact(os.environ.get("TESTS_ARTIFACT", ""), data)
+
+
+def stage(cmd):
+    """Шаги этапа в agent.yml (шаг E). Любой отказ — код 1 с причиной."""
+    try:
+        value = _artifact_value()
+        if cmd == "materialize":
+            # Файлы тестов в рабочую копию; STUB=1 — ещё и заглушка модуля
+            # (только во временной копии job stub-check, не в ветке).
+            for path in ta.write_files(value, os.environ["WRITE_ROOT"]):
+                print(f"test file: {path}")
+            if os.environ.get("STUB") == "1":
+                print(f"stub: {ta.write_stub(value, os.environ['WRITE_ROOT'])} exports {value['interface']['exports']}")
+            print("files=" + " ".join(f["path"] for f in value["files"]))
+            return 0
+        if cmd == "slug":
+            print(ta.branch_slug(value["interface"]))
+            return 0
+        if cmd == "stub-verdict":
+            try:
+                with open(os.environ["REPORT"], encoding="utf-8") as fh:
+                    report = json.load(fh)
+            except (OSError, ValueError):
+                report = None
+            problems = ta.stub_verdict(report, value)
+            for p in problems:
+                print(f"::error::tests on stub: {p}")
+            if problems:
+                print(f"STUB_CHECK=FAIL ({len(problems)})")
+                return 1
+            n = sum(len(c["tests"]) for c in value["criteria"])
+            print(f"STUB_CHECK=PASS — every test failed on the stub; criteria {len(value['criteria'])}, mapped tests {n}")
+            return 0
+    except rl.Unknown as exc:
+        print(f"::error::test author stage {cmd}: UNKNOWN({exc.reason})")
+        return 1
+    print("usage: test_author.py author|materialize|slug|stub-verdict", file=sys.stderr)
+    return 2
+
+
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else ""
+    if cmd in ("materialize", "slug", "stub-verdict"):
+        return stage(cmd)
     if cmd != "author":
-        print("usage: test_author.py author", file=sys.stderr)
+        print("usage: test_author.py author|materialize|slug|stub-verdict", file=sys.stderr)
         return 2
 
     def factory():

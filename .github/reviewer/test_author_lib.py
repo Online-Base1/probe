@@ -17,12 +17,13 @@
 (tests/test_test_author.py).
 """
 
+import hashlib
 import json
 import os
 import posixpath
 import re
 
-from reviewer_lib import Unknown, check_schema_supported, parse_response
+from reviewer_lib import Unknown, _reject_duplicate_keys, check_schema_supported, parse_response
 
 PROMPT_PATH = "prompts/03-tests.md"
 FORMAT_PATH = "standards/test-author-format.md"
@@ -213,3 +214,90 @@ def summary(value):
                        "criteria": len(value["criteria"]),
                        "interface": value["interface"],
                        "assumptions": len(value["assumptions"])}, ensure_ascii=False)
+
+
+# --- Этап в agent.yml (шаг E): артефакт, заглушка, вердикт на заглушке ---
+
+TESTS_ARTIFACT_PREFIX = "agent-tests-"
+_ASSERTION_NOT_RUN = {"skipped", "pending", "todo", "disabled"}
+
+
+def verify_tests_artifact(name, data):
+    """sha256 байтов ответа == суффиксу имени артефакта agent-tests-<sha256>."""
+    if not name.startswith(TESTS_ARTIFACT_PREFIX):
+        raise Unknown("tests_artifact_name")
+    if hashlib.sha256(data).hexdigest() != name[len(TESTS_ARTIFACT_PREFIX):]:
+        raise Unknown("tests_hash_mismatch")
+
+
+def load_tests_artifact(name, data, task_text=None):
+    """Ответ из артефакта: хеш, JSON без дублей ключей, проверки адаптера заново."""
+    verify_tests_artifact(name, data)
+    try:
+        value = json.loads(data.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys)
+    except (UnicodeDecodeError, ValueError):
+        raise Unknown("tests_artifact_not_json")
+    if task_text is None:
+        # Задания у job роли нет (снимок он не трогает): критерии уже сверены
+        # адаптером; здесь — всё, что задания не требует.
+        task_text = "\n".join("- " + c.get("criterion", "") for c in value.get("criteria") or [])
+    return check_response(value, task_text)
+
+
+def branch_slug(iface):
+    """Кратко для имени ветки agent/<дата>-<кратко>-<номер>: из имени модуля."""
+    base = posixpath.splitext(posixpath.basename(iface["module"]))[0].lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", base).strip("-")[:40].strip("-")
+    return slug or "tests"
+
+
+def write_stub(value, root):
+    """Заглушка на месте interface.module (во временной копии, не в ветке)."""
+    module = value["interface"]["module"]
+    if ".." in module.split("/") or not _MODULE_RE.match(module):
+        raise Unknown(f"interface_module:{module[:80]}")
+    dest = os.path.join(root, *module.split("/"))
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as fh:
+        fh.write(stub_source(value["interface"]))
+    return module
+
+
+def stub_verdict(report, value):
+    """Тесты автора на заглушке (D-174 §c). Пустой список — все красны по делу.
+
+    report — JSON-отчёт vitest (--reporter=json). Каждый новый файл обязан
+    быть запущен и дать тесты; файл, упавший без тестов, — падение на
+    загрузке (импорт, синтаксис), доказательством не считается. Каждый тест
+    обязан упасть: зелёный на заглушке тест вакуумен, пропущенный — не
+    проверен. Тесты из карты критериев обязаны быть среди запущенных.
+    """
+    problems = []
+    results = report.get("testResults") if isinstance(report, dict) else None
+    if not isinstance(results, list):
+        return ["stub_report_unreadable"]
+    ran = set()
+    for f in value["files"]:
+        path = f["path"]
+        hits = [r for r in results if str(r.get("name", "")).replace("\\", "/").endswith("/" + path)]
+        if not hits:
+            problems.append(f"not_run:{path}")
+            continue
+        tests = [a for r in hits for a in (r.get("assertionResults") or [])]
+        if not tests:
+            msg = " ".join(str(r.get("message", "")) for r in hits).split("\n")[0][:200]
+            problems.append(f"failed_to_load:{path}: {msg}")
+            continue
+        for a in tests:
+            name = a.get("fullName") or a.get("title") or "?"
+            ran.add(a.get("title"))
+            status = a.get("status")
+            if status == "passed":
+                problems.append(f"green_on_stub:{path}: {name}")
+            elif status in _ASSERTION_NOT_RUN or status != "failed":
+                problems.append(f"not_run_on_stub:{path}: {name} ({status})")
+    for c in value["criteria"]:
+        for t in c["tests"]:
+            if t not in ran:
+                problems.append(f"criterion_test_not_run:{t[:80]}")
+    return problems
