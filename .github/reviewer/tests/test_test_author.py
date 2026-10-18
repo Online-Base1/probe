@@ -37,7 +37,7 @@ TASK = ("В продуктовый код probe добавить чистую ф
         "- пустой вход → '' (пустая строка);\n"
         "Больше ничего не менять.\n").encode()
 
-CONTENT = ('import { describe, expect, it } from "vitest";\n'
+CONTENT = ('import { describe, expect, it, test } from "vitest";\n'
            'import { slugify } from "../../lib/slug";\n\n'
            'describe("slugify", () => {\n'
            '  it("переводит в нижний регистр", () => {\n    expect(slugify("AbC")).toBe("abc");\n  });\n'
@@ -334,3 +334,155 @@ import unittest.mock  # noqa: E402
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --- Шаг E: артефакт, заглушка, вердикт на заглушке ---------------------------
+
+def tests_artifact(value=VALID):
+    data = json.dumps(value, ensure_ascii=False, indent=2).encode()
+    return "agent-tests-" + hashlib.sha256(data).hexdigest(), data
+
+
+def vitest_report(statuses, path="tests/unit/slug.test.ts", titles=None, message=""):
+    titles = titles or ["переводит в нижний регистр", "не-ASCII буква — разделитель", "пустой вход"]
+    return {"testResults": [{
+        "name": "/home/runner/work/probe/probe/" + path,
+        "status": "failed" if "failed" in statuses or not statuses else "passed",
+        "message": message,
+        "assertionResults": [{"title": t, "fullName": "slugify " + t, "status": st,
+                              "failureMessages": ["Error: stub"] if st == "failed" else []}
+                             for t, st in zip(titles, statuses)]}]}
+
+
+class StageArtifact(unittest.TestCase):
+    def test_artifact_roundtrip(self):
+        name, data = tests_artifact()
+        self.assertEqual(ta.load_tests_artifact(name, data)["interface"]["module"], "lib/slug.ts")
+
+    def test_artifact_hash_mismatch(self):
+        name, data = tests_artifact()
+        with self.assertRaises(rl.Unknown) as cm:
+            ta.load_tests_artifact(name, data + b" ")
+        self.assertEqual(cm.exception.reason, "tests_hash_mismatch")
+
+    def test_artifact_wrong_prefix(self):
+        _, data = tests_artifact()
+        with self.assertRaises(rl.Unknown) as cm:
+            ta.load_tests_artifact("agent-task-" + hashlib.sha256(data).hexdigest(), data)
+        self.assertEqual(cm.exception.reason, "tests_artifact_name")
+
+    def test_artifact_duplicate_key(self):
+        data = json.dumps(VALID, ensure_ascii=False)[:-1].encode() + b', "assumptions": []}'
+        with self.assertRaises(rl.Unknown) as cm:
+            ta.load_tests_artifact("agent-tests-" + hashlib.sha256(data).hexdigest(), data)
+        self.assertEqual(cm.exception.reason, "response_duplicate_key")
+
+    def test_artifact_rechecked(self):
+        # Артефакт проверяется заново: подложенный путь вне tests/unit — отказ и здесь.
+        name, data = tests_artifact(variant(files=[{"path": "lib/slug.test.ts", "content": CONTENT}]))
+        with self.assertRaises(rl.Unknown) as cm:
+            ta.load_tests_artifact(name, data)
+        self.assertTrue(cm.exception.reason.startswith("file_path_outside_tests_unit"))
+
+    def test_branch_slug(self):
+        self.assertEqual(ta.branch_slug({"module": "lib/group-by.ts"}), "group-by")
+        self.assertEqual(ta.branch_slug({"module": "components/CostsView.tsx"}), "costsview")
+        self.assertEqual(ta.branch_slug({"module": "lib/__.ts"}), "tests")
+
+    def test_write_stub_replaces_module(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "lib"))
+            with open(os.path.join(root, "lib", "slug.ts"), "w") as fh:
+                fh.write("export const real = 1;\n")
+            self.assertEqual(ta.write_stub(VALID, root), "lib/slug.ts")
+            with open(os.path.join(root, "lib", "slug.ts")) as fh:
+                self.assertEqual(fh.read(), ta.stub_source(VALID["interface"]))
+
+    def test_write_stub_refuses_bad_module(self):
+        with tempfile.TemporaryDirectory() as root, self.assertRaises(rl.Unknown):
+            ta.write_stub(variant(interface={"module": "../x.ts", "exports": ["f"]}), root)
+
+
+class StubVerdict(unittest.TestCase):
+    def test_all_failed_passes(self):
+        self.assertEqual(ta.stub_verdict(vitest_report(["failed"] * 3), VALID), [])
+
+    def test_green_on_stub_named(self):
+        p = ta.stub_verdict(vitest_report(["failed", "passed", "failed"]), VALID)
+        self.assertEqual(p, ["green_on_stub:tests/unit/slug.test.ts: slugify не-ASCII буква — разделитель"])
+
+    def test_skipped_and_todo_not_proof(self):
+        for st in ("skipped", "todo", "pending"):
+            with self.subTest(st=st):
+                p = ta.stub_verdict(vitest_report(["failed", st, "failed"]), VALID)
+                self.assertTrue(p and p[0].startswith("not_run_on_stub:"), p)
+
+    def test_failed_to_load_is_not_proof(self):
+        # Падение на импорте (нет модуля, синтаксис) — файл без тестов: не доказательство.
+        r = vitest_report([], message="Error: Failed to load url ../../lib/slug\n at ...")
+        p = ta.stub_verdict(r, VALID)
+        self.assertTrue(p[0].startswith("failed_to_load:tests/unit/slug.test.ts: Error: Failed to load"), p)
+
+    def test_file_not_run(self):
+        p = ta.stub_verdict(vitest_report(["failed"] * 3, path="tests/unit/other.test.ts"), VALID)
+        self.assertEqual(p[0], "not_run:tests/unit/slug.test.ts")
+
+    def test_criterion_test_must_run(self):
+        r = vitest_report(["failed", "failed"], titles=["переводит в нижний регистр", "пустой вход"])
+        self.assertEqual(ta.stub_verdict(r, VALID), ["criterion_test_not_run:не-ASCII буква — разделитель"])
+
+    def test_unreadable_report(self):
+        self.assertEqual(ta.stub_verdict(None, VALID), ["stub_report_unreadable"])
+        self.assertEqual(ta.stub_verdict({"x": 1}, VALID), ["stub_report_unreadable"])
+
+
+class StageCli(unittest.TestCase):
+    def run_stage(self, cmd, value=VALID, report=None, extra=None, tamper=False):
+        with tempfile.TemporaryDirectory() as d:
+            name, data = tests_artifact(value)
+            resp = os.path.join(d, "response.json")
+            with open(resp, "wb") as fh:
+                fh.write(data + (b" " if tamper else b""))
+            env = {"TESTS_ARTIFACT": name, "RESPONSE": resp, "WRITE_ROOT": os.path.join(d, "root")}
+            os.makedirs(env["WRITE_ROOT"])
+            if report is not None:
+                env["REPORT"] = os.path.join(d, "report.json")
+                with open(env["REPORT"], "w") as fh:
+                    json.dump(report, fh)
+            env.update(extra or {})
+            with unittest.mock.patch.dict(os.environ, env), contextlib.redirect_stdout(io.StringIO()) as o:
+                code = tau.main(["test_author.py", cmd])
+            tree = sorted(os.path.relpath(os.path.join(dp, f), env["WRITE_ROOT"])
+                          for dp, _, fs in os.walk(env["WRITE_ROOT"]) for f in fs)
+        return code, o.getvalue(), tree
+
+    def test_materialize_tests_only(self):
+        code, out, tree = self.run_stage("materialize")
+        self.assertEqual((code, tree), (0, ["tests/unit/slug.test.ts"]))
+        self.assertIn("files=tests/unit/slug.test.ts", out)
+
+    def test_materialize_with_stub(self):
+        code, out, tree = self.run_stage("materialize", extra={"STUB": "1"})
+        self.assertEqual((code, tree), (0, ["lib/slug.ts", "tests/unit/slug.test.ts"]))
+
+    def test_materialize_tampered_artifact_writes_nothing(self):
+        code, out, tree = self.run_stage("materialize", tamper=True)
+        self.assertEqual((code, tree), (1, []))
+        self.assertIn("UNKNOWN(tests_hash_mismatch)", out)
+
+    def test_slug(self):
+        code, out, _ = self.run_stage("slug")
+        self.assertEqual((code, out.strip()), (0, "slug"))
+
+    def test_stub_verdict_pass_and_fail(self):
+        code, out, _ = self.run_stage("stub-verdict", report=vitest_report(["failed"] * 3))
+        self.assertEqual(code, 0)
+        self.assertIn("STUB_CHECK=PASS", out)
+        code, out, _ = self.run_stage("stub-verdict", report=vitest_report(["failed", "passed", "failed"]))
+        self.assertEqual(code, 1)
+        self.assertIn("green_on_stub", out)
+
+    def test_stub_verdict_missing_report_fails(self):
+        code, out, _ = self.run_stage("stub-verdict", extra={"REPORT": "/nonexistent/report.json"})
+        self.assertEqual(code, 1)
+        self.assertIn("stub_report_unreadable", out)

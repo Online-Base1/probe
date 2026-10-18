@@ -66,8 +66,90 @@ class Workflows(unittest.TestCase):
         self.assertIn("name: ${{ steps.snap.outputs.artifact }}", snap)
         self.assertIn("artifact=agent-task-$sha", snap)
         role = job_block(t, "role")
-        self.assertRegex(role, r"(?m)^    needs: task-snapshot$")
+        self.assertRegex(role, r"(?m)^    needs: \[task-snapshot, test-author, stub-check\]$")
         self.assertNotIn("agent-task", role)
+
+    def test_test_author_job(self):
+        # D-174 §e.E: только снимок задания на входе, артефакт agent-tests-<sha> на
+        # выходе; WIF автора тестов; factory-knowledge — узким токеном ревьюера;
+        # записи в GitHub нет и токена исполнителя нет.
+        t = read("agent.yml")
+        ta_ = job_block(t, "test-author")
+        self.assertRegex(ta_, r"(?m)^    needs: task-snapshot$")
+        perms = re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", ta_).group(1)
+        self.assertEqual(sorted(perms.split()), sorted(["contents:", "read", "id-token:", "write"]))
+        self.assertIn("name: ${{ needs.task-snapshot.outputs.artifact }}", ta_)
+        self.assertIn("OPENAI_TEST_AUTHOR_SERVICE_ACCOUNT_ID: ${{ vars.OPENAI_TEST_AUTHOR_SERVICE_ACCOUNT_ID }}", ta_)
+        self.assertNotIn("OPENAI_REVIEWER_SERVICE_ACCOUNT_ID", ta_)
+        self.assertNotIn("FACTORY_APP_PRIVATE_KEY", ta_)          # токен исполнителя не выпускается
+        self.assertEqual(ta_.count("create-github-app-token@"), 1)
+        mint = ta_[ta_.index("create-github-app-token@"):ta_.index("- name: Run test author")]
+        self.assertIn("repositories: factory-knowledge", mint)
+        self.assertIn("permission-contents: read", mint)
+        self.assertNotIn("write", mint)
+        self.assertIn("persist-credentials: false", ta_)
+        self.assertIn(".github/reviewer/test_author.py author", ta_)
+        self.assertIn('echo "artifact=agent-tests-$(sha256sum "$OUT" | cut -d\' \' -f1)"', ta_)
+        self.assertIn("name: ${{ steps.author.outputs.artifact }}", ta_)
+
+    def test_stub_check_job_has_no_credentials(self):
+        # Здесь исполняется код модели: ни токенов, ни id-token, ни учётных данных git.
+        sc = job_block(read("agent.yml"), "stub-check")
+        self.assertRegex(sc, r"(?m)^    needs: test-author$")
+        self.assertRegex(sc, r"(?m)^    permissions: \{\}$")
+        self.assertNotIn("create-github-app-token", sc)
+        self.assertNotIn("secrets.", sc)
+        self.assertNotIn("if:", sc.replace("if: github.ref != 'refs/heads/main'", ""))   # вне условий
+        self.assertIn("persist-credentials: false", sc)
+        self.assertIn("STUB: \"1\"", sc)
+        self.assertIn("npm ci --ignore-scripts", sc)
+        self.assertIn("--reporter=json", sc)
+        self.assertIn("test_author.py stub-verdict || exit 1", sc)
+        self.assertLess(sc.index("npm ci --ignore-scripts"), sc.index("vitest run"))
+
+    def test_role_freezes_tests_before_coder(self):
+        role = job_block(read("agent.yml"), "role")
+        freeze = self.step_block(role, "Freeze tests (branch, one commit, tree)")
+        self.assertLess(role.index("- name: Environment check (runtime)"), role.index("- name: Freeze tests"))
+        self.assertLess(role.index("- name: Freeze tests"), role.index("- name: Run role"))
+        self.assertNotIn("if:", freeze.split("run: |")[0])
+        self.assertIn('[ "$TESTS_ARTIFACT" != "$STUB_CHECKED" ]', freeze)
+        self.assertIn("STUB_CHECKED: ${{ needs.stub-check.outputs.artifact }}", freeze)
+        self.assertIn('branch="agent/${TODAY}-$(python3 .github/reviewer/test_author.py slug)-${RUN_NUMBER}"', freeze)
+        self.assertIn("grep -v '^?? tests/unit/'", freeze)
+        self.assertEqual(freeze.count("commit -q -m"), 1)
+        self.assertIn('tree="$(git rev-parse HEAD:tests)"', freeze)
+        self.assertIn('echo "tree=$tree" >> "$GITHUB_OUTPUT"', freeze)
+
+    def test_coder_writes_product_paths_only(self):
+        role = job_block(read("agent.yml"), "role")
+        allowed = re.search(r'--allowedTools "([^"]*)"', role).group(1).split(",")
+        self.assertNotIn("Edit", allowed)
+        self.assertNotIn("Write", allowed)
+        writes = sorted(a for a in allowed if a.startswith(("Edit(", "Write(")))
+        self.assertEqual(writes, sorted(f"{t}({p}/**)" for t in ("Edit", "Write")
+                                        for p in ("app", "lib", "components", "prisma")))
+        self.assertNotIn("Bash(git checkout -b:*)", allowed)
+        self.assertIn('--disallowedTools "Edit(tests/**),Write(tests/**)"', role)
+        prompt = role[role.index("prompt: |"):]
+        self.assertIn("${{ steps.freeze.outputs.branch }}", prompt)
+        self.assertIn("Тесты в tests/ ЗАМОРОЖЕНЫ", prompt)
+        self.assertNotIn("--body-file", prompt)
+        self.assertIn("tests/unit/agent-tests-canary-{0}.txt", prompt)
+
+    def test_tests_canary_and_tree_check(self):
+        role = job_block(read("agent.yml"), "role")
+        sd = self.step_block(role, "Surface permission denials")
+        self.assertIn('contains("agent-tests-canary-" + $rid)', sd)
+        self.assertIn("select((is_canary or is_tests_canary) | not)", sd)
+        vp = self.step_block(role, "Verify path scoping (tests canary)")
+        self.assertIn("if: always()", vp)
+        self.assertIn("tests_canary_found == true", vp)
+        ve = self.step_block(role, "Verify envelope via GitHub API")
+        self.assertIn("FROZEN_TREE: ${{ steps.freeze.outputs.tree }}", ve)
+        self.assertIn('now_tree="$(git rev-parse FETCH_HEAD:tests)"', ve)
+        self.assertIn('[ "$now_tree" != "$FROZEN_TREE" ]', ve)
+        self.assertIn('[ "$branch" != "$BRANCH" ]', ve)
 
     def test_role_sets_pr_body_at_create_never_edits(self):
         # BB-47: тело — в gh pr create; gh pr edit не выдаётся (шире: base,

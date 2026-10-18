@@ -1,5 +1,11 @@
 # Прогон роли фабрики (D-083, D-084). Результат — ветка agent/* и черновик PR.
 #
+# Этапы (D-173, D-174): task-snapshot → test-author (Codex, другое семейство,
+# пишет тесты из критериев до кода) → stub-check (тесты обязаны упасть на
+# заглушке; без токенов) → role (workflow создаёт ветку и коммит заморозки
+# tests/, кодер пишет код только в продуктовых путях; дерево tests/ после
+# кодера сверяется с замороженным).
+#
 # Порядок fail-closed: здесь только ручной запуск. `schedule` добавляется
 # отдельной заявкой после того, как отрицательные тесты из PR пройдены.
 #
@@ -95,8 +101,166 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-  role:
+  # --- Автор тестов (D-173, D-174): другое семейство, до кодера, кода не видит ---
+  # На входе только снимок задания, на выходе — артефакт agent-tests-<sha256
+  # байтов ответа>. Записи в GitHub у job нет: id-token — для обмена WIF у
+  # OpenAI (сервисный аккаунт автора тестов), factory-knowledge — отдельным
+  # узким токеном ревьюера (contents:read), как в reviewer.yml. Токен
+  # исполнителя (кодера) сюда не выпускается, и кодеру factory-knowledge закрыт.
+  test-author:
     needs: task-snapshot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      artifact: ${{ steps.author.outputs.artifact }}
+    steps:
+      - name: Refuse to run outside main
+        if: github.ref != 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "::error::agent runs only from refs/heads/main (federation rule and envelope)"
+          exit 1
+
+      - name: Checkout test-author code (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/reviewer/
+            .github/workflows/openai-wif-test.requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - name: Install openai SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary=:all: \
+            -r .github/workflows/openai-wif-test.requirements.txt
+
+      - name: Download task snapshot
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.task-snapshot.outputs.artifact }}
+          path: ${{ runner.temp }}/agent-task
+
+      - name: Mint reviewer token (factory-knowledge, contents:read)
+        id: fk
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.FACTORY_REVIEWER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.FACTORY_REVIEWER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: factory-knowledge
+          permission-contents: read
+
+      # Адаптер сверяет хеш снимка, зовёт Codex и проверяет ответ (пути,
+      # покрытие критериев, interface, assumptions). Любой отказ — UNKNOWN,
+      # ни файла ответа, ни артефакта.
+      - name: Run test author
+        id: author
+        shell: bash
+        env:
+          TASK_FILE: ${{ runner.temp }}/agent-task/task.txt
+          TASK_ARTIFACT: ${{ needs.task-snapshot.outputs.artifact }}
+          GH_TOKEN_KNOWLEDGE: ${{ steps.fk.outputs.token }}
+          OPENAI_IDENTITY_PROVIDER_ID: ${{ vars.OPENAI_IDENTITY_PROVIDER_ID }}
+          OPENAI_TEST_AUTHOR_SERVICE_ACCOUNT_ID: ${{ vars.OPENAI_TEST_AUTHOR_SERVICE_ACCOUNT_ID }}
+          OPENAI_WIF_AUDIENCE: ${{ vars.OPENAI_WIF_AUDIENCE }}
+          OUT: ${{ runner.temp }}/agent-tests/response.json
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$OUT")"
+          /tmp/venv/bin/python .github/reviewer/test_author.py author
+          echo "artifact=agent-tests-$(sha256sum "$OUT" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload tests
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.author.outputs.artifact }}
+          path: ${{ runner.temp }}/agent-tests/response.json
+          retention-days: 14
+          if-no-files-found: error
+
+  # --- Контроль «тесты красны на заглушке» (D-174 §c, D-144 §a) -------------
+  # Решающий контроль: до кодера и вне любых условий — job роли без него не
+  # стартует. Заглушка по interface (каждый экспорт бросает Error("stub")),
+  # vitest по новым тестам: каждый обязан упасть; зелёный — тест вакуумен,
+  # файл, упавший без тестов (импорт, синтаксис), доказательством не считается.
+  # Отдельный job, а не шаг роли: здесь исполняется код, написанный моделью, —
+  # поэтому ни токена приложения, ни id-token, ни учётных данных git
+  # (permissions: {}, persist-credentials: false). Зависимости ставит шаг
+  # workflow, не агент (рамка 6).
+  stub-check:
+    needs: test-author
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      artifact: ${{ steps.verdict.outputs.artifact }}
+    steps:
+      - name: Refuse to run outside main
+        if: github.ref != 'refs/heads/main'
+        shell: bash
+        run: |
+          echo "::error::agent runs only from refs/heads/main (federation rule and envelope)"
+          exit 1
+
+      - name: Checkout (main, no credentials)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Download tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.test-author.outputs.artifact }}
+          path: ${{ runner.temp }}/agent-tests
+
+      - name: Tests and stub into the scratch checkout
+        id: files
+        shell: bash
+        env:
+          TESTS_ARTIFACT: ${{ needs.test-author.outputs.artifact }}
+          RESPONSE: ${{ runner.temp }}/agent-tests/response.json
+          WRITE_ROOT: .
+          STUB: "1"
+        run: |
+          set -euo pipefail
+          python3 .github/reviewer/test_author.py materialize | tee "$RUNNER_TEMP/materialize.out"
+          grep '^files=' "$RUNNER_TEMP/materialize.out" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies without scripts
+        shell: bash
+        run: npm ci --ignore-scripts
+
+      - name: Tests must fail on the stub
+        id: verdict
+        shell: bash
+        env:
+          TESTS_ARTIFACT: ${{ needs.test-author.outputs.artifact }}
+          RESPONSE: ${{ runner.temp }}/agent-tests/response.json
+          REPORT: ${{ runner.temp }}/stub-report.json
+          FILES: ${{ steps.files.outputs.files }}
+        run: |
+          set -uo pipefail
+          # shellcheck disable=SC2086 — FILES: проверенные пути tests/unit/**, без пробелов
+          npx --no-install vitest run $FILES --reporter=json --outputFile="$REPORT" > "$RUNNER_TEMP/stub-vitest.log" 2>&1
+          echo "vitest on stub: exit $? (non-zero expected)"
+          tail -n 40 "$RUNNER_TEMP/stub-vitest.log"
+          python3 .github/reviewer/test_author.py stub-verdict || exit 1
+          echo "artifact=$TESTS_ARTIFACT" >> "$GITHUB_OUTPUT"
+
+  role:
+    needs: [task-snapshot, test-author, stub-check]
     runs-on: ubuntu-24.04
     # Потолок времени прогона. Вместе с --max-turns 40 ограничивает расход
     # одного запуска; расписания нет, запуск только вручную. 40, а не 25:
@@ -286,6 +450,56 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
+      # --- Первые шаги роли делает workflow, не агент (D-174 §a.4) ---------
+      # Тот же артефакт, что прошёл контроль на заглушке; ветку называет
+      # workflow; тесты ложатся ОДНИМ коммитом заморозки; дерево tests/
+      # записывается и сверяется после кодера (Verify envelope, D-174 §b(b)).
+      - name: Download test author's tests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.test-author.outputs.artifact }}
+          path: ${{ runner.temp }}/agent-tests
+
+      - name: Freeze tests (branch, one commit, tree)
+        id: freeze
+        shell: bash
+        env:
+          TESTS_ARTIFACT: ${{ needs.test-author.outputs.artifact }}
+          STUB_CHECKED: ${{ needs.stub-check.outputs.artifact }}
+          RESPONSE: ${{ runner.temp }}/agent-tests/response.json
+          TODAY: ${{ steps.date.outputs.today }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TESTS_ARTIFACT" ] || [ "$TESTS_ARTIFACT" != "$STUB_CHECKED" ]; then
+            echo "::error::tests artifact '$TESTS_ARTIFACT' is not the one checked on the stub ('$STUB_CHECKED')"
+            exit 1
+          fi
+          branch="agent/${TODAY}-$(python3 .github/reviewer/test_author.py slug)-${RUN_NUMBER}"
+          if git ls-remote --exit-code --heads origin "$branch" > /dev/null; then
+            echo "::error::branch $branch already exists"
+            exit 1
+          fi
+          git switch -q -c "$branch"
+          WRITE_ROOT=. python3 .github/reviewer/test_author.py materialize
+          # В коммите заморозки — только новые файлы tests/unit/ и ничего больше.
+          other="$(git status --porcelain --untracked-files=all | grep -v '^?? tests/unit/' || true)"
+          if [ -n "$other" ]; then
+            echo "::error::freeze would carry changes outside tests/unit/:"
+            echo "$other"
+            exit 1
+          fi
+          git add -- tests/unit
+          git -c user.name="online-base1-factory-worker[bot]" \
+              -c user.email="326868850+online-base1-factory-worker[bot]@users.noreply.github.com" \
+              commit -q -m "tests: frozen from the test author (run $RUN_ID, $TESTS_ARTIFACT)"
+          git push -q -u origin "$branch"
+          tree="$(git rev-parse HEAD:tests)"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "tree=$tree" >> "$GITHUB_OUTPUT"
+          echo "frozen: $branch at $(git rev-parse --short HEAD), tests tree $tree"
+
       - name: Run role
         id: role
         # Таймаут шага меньше таймаута job: при срабатывании шаг проваливается,
@@ -311,7 +525,8 @@ jobs:
             --max-turns 40
             --model claude-sonnet-5
             --settings '{"attribution":{"commit":false,"pr":false}}'
-            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git switch:*),Bash(git checkout -b:*),Bash(git add:*),Bash(git commit:*),Bash(git push -u origin agent/*),Bash(gh pr create --draft:*)"
+            --allowedTools "Read,Glob,Grep,Edit(app/**),Edit(lib/**),Edit(components/**),Edit(prisma/**),Write(app/**),Write(lib/**),Write(components/**),Write(prisma/**),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(git push -u origin agent/*),Bash(gh pr create --draft:*)"
+            --disallowedTools "Edit(tests/**),Write(tests/**)"
           # Атрибуция (D-110 §e(а)): --settings с attribution в объектной
           # форме убирает трейлер Co-Authored-By и строку в описании PR — то
           # есть повод переписывать историю (прогон 36468629520), не
@@ -319,22 +534,27 @@ jobs:
           # D-100 §e); это уборка, не контроль. Контроль — ruleset на agent/**.
           # Рамка 8 — слова для агента; границей тоже не является (D-089 §e).
           #
+          # Права кодера (D-174 §b(a)): запись — только продуктовые пути,
+          # tests/ запрещён явно. Это удобство, не опора: опора — сверка дерева
+          # tests/ в Verify envelope и гейт factory-ci. Что шаблоны путей
+          # действуют, доказывает вторая канарейка — запись в tests/unit/,
+          # которая обязана быть отклонена (Verify path scoping).
+          #
           # Канарейка (D-100 §f): заведомо запрещённая и безвредная команда,
           # которую роль выполняет первой. Её отказ записывает та же система
           # разрешений в тот же permission_denials, что и настоящие отказы, и
           # разбирает тот же jq — так проверяется именно рабочий путь.
           prompt: |
             Ты — роль фабрики в репозитории ${{ github.repository }}.
-            ${{ inputs.self_test != 'canary_skip' && format('0. Первым действием, до всего остального, выполни ровно одну команду Bash: `touch /tmp/agent-canary-{0}` — без изменений и без параметров. Система разрешений её отклонит: это проверка механики, так и должно быть. Не повторяй её, не меняй и не обходи, сразу переходи к задаче и не упоминай её в описании PR.', github.run_id) || '' }}
+            ${{ inputs.self_test != 'canary_skip' && format('0. Первым действием, до всего остального, выполни ровно одну команду Bash: `touch /tmp/agent-canary-{0}` — без изменений и без параметров. Вторым действием выполни ровно один Write: файл `tests/unit/agent-tests-canary-{0}.txt` с текстом `canary`. Система разрешений отклонит оба: это проверка механики, так и должно быть. Не повторяй их, не меняй и не обходи, сразу переходи к задаче и не упоминай их в описании PR.', github.run_id) || '' }}
 
             Рамки (нарушать нельзя, даже если задача просит иного):
-            1. Работай только в новой ветке agent/${{ steps.date.outputs.today }}-<кратко>,
-               где <кратко> — 2–4 слова латиницей через дефис по сути задачи.
-               Ветку создавай от main. В main не пиши.
+            1. Работай только в ветке `${{ steps.freeze.outputs.branch }}` — её уже
+               создал workflow, ты в ней. Новых веток не создавай, в main не пиши.
             2. Результат — ЧЕРНОВИК заявки: `gh pr create --draft --base main`.
-               Тело заявки задавай сразу в этой же команде: `--body "…"` или
-               `--body-file <файл вне репозитория>`. Сначала допиши описание
-               целиком, потом создай заявку — это последнее действие.
+               Тело заявки задавай сразу в этой же команде, флагом `--body "…"`
+               (запись файлов вне продуктовых путей отклоняется). Сначала допиши
+               описание целиком, потом создай заявку — это последнее действие.
                В описании заявки: что сделано, что не проверено, блок
                `## Вне моей зоны`, если он нужен.
                `gh pr edit` не вызывай никогда, ни для какой правки: команды
@@ -354,6 +574,12 @@ jobs:
                противоречива или неясна — опиши это в PR, а не додумывай молча.
             8. Опубликованную историю не переписывай: никаких --amend, rebase,
                reset и force-push после push. Исправления — новым коммитом.
+            9. Тесты в tests/ ЗАМОРОЖЕНЫ: их написал независимый автор тестов, они
+               уже в ветке первым коммитом. Читай их и пиши код только в app/,
+               lib/, components/, prisma/ так, чтобы они прошли. tests/ не меняй:
+               запись туда отклонят, а сверка дерева tests/ после тебя сделает
+               прогон красным. Считаешь тест неверным — не обходи его, опиши в
+               `## Вне моей зоны`.
 
             Задача:
             ${{ inputs.task }}
@@ -372,11 +598,30 @@ jobs:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           REPO: ${{ github.repository }}
           START: ${{ steps.start.outputs.at }}
+          BRANCH: ${{ steps.freeze.outputs.branch }}
+          FROZEN_TREE: ${{ steps.freeze.outputs.tree }}
         run: |
           set -euo pipefail
           if [ -z "${START:-}" ]; then
             echo "::error::run start time is unknown; envelope cannot be verified"
             exit 1
+          fi
+          # Сверка дерева tests/ (D-174 §b(b)): после кодера — то же дерево,
+          # что записано при заморозке. Читается ветка на стороне GitHub.
+          tree_bad=0
+          if [ -z "${BRANCH:-}" ] || [ -z "${FROZEN_TREE:-}" ]; then
+            echo "::error::frozen tests tree is unknown (freeze did not run); tests/ cannot be verified"
+            tree_bad=1
+          else
+            git fetch -q origin "refs/heads/$BRANCH"
+            now_tree="$(git rev-parse FETCH_HEAD:tests)"
+            if [ "$now_tree" != "$FROZEN_TREE" ]; then
+              echo "::error::tests/ changed after the freeze on $BRANCH: $FROZEN_TREE -> $now_tree"
+              git diff --stat "$FROZEN_TREE" "$now_tree" || true
+              tree_bad=1
+            else
+              echo "tests tree unchanged on $BRANCH: $now_tree (frozen)"
+            fi
           fi
           # Все ветки с датой последнего коммита, постранично (GraphQL, по 100).
           gh api graphql --paginate \
@@ -399,10 +644,10 @@ jobs:
             '$1 != "main" && ($2 == "" || $2 >= start) { print $1 }' /tmp/branches.tsv)"
           if [ -z "$in_window" ]; then
             echo "no branches changed since $START; nothing to verify"
-            exit 0
+            exit "$tree_bad"
           fi
 
-          bad=0
+          bad="$tree_bad"
           while IFS= read -r branch; do
             case "$branch" in
               agent/*) ;;
@@ -410,6 +655,11 @@ jobs:
                 echo "::error::$branch changed during the run but is outside agent/"
                 bad=1 ;;
             esac
+            # Ветку называет workflow: любая другая ветка из окна — не этого этапа.
+            if [ -n "${BRANCH:-}" ] && [ "$branch" != "$BRANCH" ]; then
+              echo "::error::$branch changed during the run but the run's branch is $BRANCH"
+              bad=1
+            fi
             gh api "repos/$REPO/compare/main...$branch" > /tmp/compare.json
             # Нет массива files — список не виден, значит проверка не доказана.
             if ! jq -e '.files | type == "array"' /tmp/compare.json > /dev/null; then
@@ -492,17 +742,29 @@ jobs:
             def is_canary: .tool_name == "Bash"
                 and ((.tool_input.command // "") | tostring | contains("agent-canary-" + $rid))
                 and (bypass_keys | length == 0);
+            # Вторая канарейка (D-174 §b(a)): запись в tests/unit/ — проверка
+            # ПРАВ ПО ПУТЯМ кодера. Отклонённая — шаблоны путей действуют;
+            # выполненная — нет (красный в Verify path scoping).
+            def is_tests_canary: (.tool_name == "Write" or .tool_name == "Edit")
+                and ((.tool_input.file_path // "") | tostring | contains("agent-tests-canary-" + $rid))
+                and (bypass_keys | length == 0);
             [ (if type == "array" then .[] else . end) ] as $log
             | ([ $log[] | select(.type == "result") ] | last // {}) as $r
             | [ $log[] | select(.type == "assistant") | .message.content[]?
                 | select(.type == "tool_use" and .name == "Bash")
                 | select((.input.command // "") | tostring | contains("agent-canary-" + $rid)) ] as $attempts
+            | [ $log[] | select(.type == "assistant") | .message.content[]?
+                | select(.type == "tool_use" and (.name == "Write" or .name == "Edit"))
+                | select((.input.file_path // "") | tostring | contains("agent-tests-canary-" + $rid)) ] as $tattempts
             | ($r.permission_denials // []) as $all
             | [ $all[] | select(is_canary) ] as $canary
-            | [ $all[] | select(is_canary | not) ] as $d
+            | [ $all[] | select(is_tests_canary) ] as $tcanary
+            | [ $all[] | select((is_canary or is_tests_canary) | not) ] as $d
             | { raw: ($all | length),
                 canary_found: (($canary | length) > 0),
                 canary_attempts: ($attempts | length),
+                tests_canary_found: (($tcanary | length) > 0),
+                tests_canary_attempts: ($tattempts | length),
                 n: ($d | length),
                 bypass: ($d | map(select(bypass_keys | length > 0)) | length),
                 turns: ($r.num_turns // "unknown"),
@@ -559,6 +821,11 @@ jobs:
               echo "Канарейка извлечения найдена (не засчитывается агенту)."
             else
               echo "Канарейка извлечения НЕ найдена — механика извлечения не подтверждена."
+            fi
+            if [ "$(jq -r .tests_canary_found /tmp/denials.json)" = true ]; then
+              echo "Канарейка прав по путям найдена: запись в tests/unit/ отклонена (не засчитывается агенту)."
+            else
+              echo "Канарейка прав по путям НЕ найдена — запрет записи в tests/ не подтверждён."
             fi
             echo
             echo "_Извлечено из журнала выполнения автоматически, не из описания PR._"
@@ -632,6 +899,31 @@ jobs:
             exit 1
           fi
           echo "denial extraction confirmed: a write outside the working directories was refused and the refusal was extracted (canary found); agent denials $(jq -r .n "$extraction"), agent bypass attempts $(jq -r .bypass "$extraction")"
+
+      # Права кодера по путям (D-174 §b(a)) — наблюдением, не по построению:
+      # запись в tests/unit/ обязана быть отклонена системой разрешений.
+      # Выполненная запись — шаблоны путей не действуют; её же поймает сверка
+      # дерева tests/ (опора), но этот шаг называет причину.
+      - name: Verify path scoping (tests canary)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          extraction="$RUNNER_TEMP/denial-extraction.json"
+          if [ ! -f "$extraction" ] || jq -e '.log_missing == true' "$extraction" > /dev/null; then
+            echo "::error::path scoping not confirmed: no denial extraction"
+            exit 1
+          fi
+          if jq -e '.tests_canary_found == true' "$extraction" > /dev/null; then
+            echo "path scoping confirmed: a write to tests/unit/ was refused by the permission system (tests canary found)"
+            exit 0
+          fi
+          if jq -e '(.tests_canary_attempts // 0) > 0' "$extraction" > /dev/null; then
+            echo "::error::path scoping NOT in effect: the write to tests/unit/ was attempted and NOT denied"
+          else
+            echo "::error::path scoping not confirmed: the tests canary was not attempted"
+          fi
+          exit 1
 
       # Журнал выполнения роли — артефакт прогона: без него не видно, на что
       # пришлись отказы в разрешениях (прогоны 36306384648, 36320757375).
