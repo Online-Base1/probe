@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import re
+import urllib.parse
 import zipfile
 from types import SimpleNamespace as NS
 
@@ -81,6 +82,7 @@ class World:
         self.statuses = []
         self.prompt = "You are the reviewer. Answer strictly in the format of standards/findings-format.md.".encode()
         self.format = format_md(SCHEMA)
+        self.knowledge = {}  # прочие файлы factory-knowledge: путь → байты (автор тестов)
         self.p1_status = 403
         self.p2_status = 403
         self.comment_status = 201
@@ -166,8 +168,12 @@ class World:
             return (200, {}, self.prompt) if self.prompt is not None else (404, {}, b"{}")
         if method == "GET" and path_only == f"/repos/{KR}/contents/standards/findings-format.md":
             return (200, {}, self.format) if self.format is not None else (404, {}, b"{}")
+        m = re.fullmatch(rf"/repos/{KR}/contents/(.+)", path_only)
+        if method == "GET" and m and urllib.parse.unquote(m.group(1)) in self.knowledge:
+            data = self.knowledge[urllib.parse.unquote(m.group(1))]
+            return (200, {}, data) if data is not None else (404, {}, b"{}")
         if method == "GET" and path_only == f"/repos/{KR}/commits":
-            sha = FORMAT_SHA if "findings-format" in path else PROMPT_SHA
+            sha = FORMAT_SHA if "format" in urllib.parse.unquote(path) else PROMPT_SHA
             return 200, {}, json.dumps([{"sha": sha}]).encode()
         return 599, {}, json.dumps({"unrouted": [method, path]}).encode()
 

@@ -374,13 +374,13 @@ def check_schema_supported(schema, path="$"):
 _JSON_BLOCK = re.compile(r"^```json[ \t]*\n(.*?)^```[ \t]*$", re.S | re.M)
 
 
-def check_prompt_refers_format(prompt_text):
+def check_prompt_refers_format(prompt_text, format_path=FORMAT_PATH):
     """Промпт ссылается на формат, а не повторяет его (D-104 §h, D-109 §f).
 
     Проверка присутствия, не правильности: ссылку можно вписать и в старый
     текст. Правильность промпта держит канарейка.
     """
-    if FORMAT_PATH not in prompt_text:
+    if format_path not in prompt_text:
         raise Unknown("prompt_without_format_ref")
 
 
