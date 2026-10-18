@@ -252,9 +252,13 @@ jobs:
           FILES: ${{ steps.files.outputs.files }}
         run: |
           set -uo pipefail
+          # Ненулевой выход vitest на заглушке ожидаем: шаг GitHub идёт с bash -e,
+          # поэтому код забирается через || — иначе шаг оборвётся до вердикта
+          # (прогон 39132221129). Решает вердикт по отчёту, не код выхода.
+          rc=0
           # shellcheck disable=SC2086 — FILES: проверенные пути tests/unit/**, без пробелов
-          npx --no-install vitest run $FILES --reporter=json --outputFile="$REPORT" > "$RUNNER_TEMP/stub-vitest.log" 2>&1
-          echo "vitest on stub: exit $? (non-zero expected)"
+          npx --no-install vitest run $FILES --reporter=json --outputFile="$REPORT" > "$RUNNER_TEMP/stub-vitest.log" 2>&1 || rc=$?
+          echo "vitest on stub: exit $rc (non-zero expected)"
           tail -n 40 "$RUNNER_TEMP/stub-vitest.log"
           python3 .github/reviewer/test_author.py stub-verdict || exit 1
           echo "artifact=$TESTS_ARTIFACT" >> "$GITHUB_OUTPUT"
