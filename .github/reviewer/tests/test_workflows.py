@@ -69,6 +69,17 @@ class Workflows(unittest.TestCase):
         self.assertRegex(role, r"(?m)^    needs: task-snapshot$")
         self.assertNotIn("agent-task", role)
 
+    def test_role_sets_pr_body_at_create_never_edits(self):
+        # BB-47: тело — в gh pr create; gh pr edit не выдаётся (шире: base,
+        # reviewers, labels) и запрещён промптом, а не правами.
+        role = job_block(read("agent.yml"), "role")
+        allowed = re.search(r'--allowedTools "([^"]*)"', role).group(1)
+        self.assertIn("Bash(gh pr create --draft:*)", allowed.split(","))
+        self.assertNotIn("gh pr edit", allowed)
+        prompt = role[role.index("prompt: |"):]
+        self.assertIn("`--body", prompt)
+        self.assertIn("`gh pr edit` не вызывай никогда", prompt)
+
     def test_worker_probe_before_role(self):
         role = job_block(read("agent.yml"), "role")
         self.assertLess(role.index("Worker token cannot read factory-knowledge"), role.index("- name: Run role"))
