@@ -324,3 +324,59 @@ class Workflows(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(REQUIRED or os.path.isfile(os.path.join(WF, "agent.yml")), "workflow files not checked out")
+class StubCheckStep(unittest.TestCase):
+    """Шаг «Tests must fail on the stub» исполняется как в GitHub — bash -e -o pipefail.
+
+    Прогон 39132221129: ожидаемо ненулевой выход vitest оборвал шаг до вердикта.
+    Здесь vitest подменён: пишет отчёт и выходит с 1 (как на заглушке).
+    """
+
+    def run_step(self, statuses):
+        import hashlib, json, subprocess, tempfile
+        sys.path.insert(0, os.path.join(HERE, ".."))
+        sys.path.insert(0, HERE)
+        import test_test_author as T
+        t = read("agent.yml")
+        sc = job_block(t, "stub-check")
+        body = sc[sc.index("- name: Tests must fail on the stub"):]
+        script = re.search(r"\n        run: \|\n((?:          .*\n|\n)+)", body).group(1)
+        script = "\n".join(line[10:] for line in script.splitlines())
+        with tempfile.TemporaryDirectory() as d:
+            data = json.dumps(T.VALID, ensure_ascii=False).encode()
+            name = "agent-tests-" + hashlib.sha256(data).hexdigest()
+            with open(os.path.join(d, "response.json"), "wb") as fh:
+                fh.write(data)
+            report = T.vitest_report(statuses)
+            fake = os.path.join(d, "bin")
+            os.makedirs(fake)
+            with open(os.path.join(fake, "npx"), "w") as fh:
+                fh.write("#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --outputFile=*) out=\"${a#--outputFile=}\";; esac; done\n"
+                         f"printf '%s' '{json.dumps(report, ensure_ascii=False)}' > \"$out\"\nexit 1\n")
+            os.chmod(os.path.join(fake, "npx"), 0o755)
+            os.makedirs(os.path.join(d, "repo", ".github"))
+            os.symlink(os.path.join(HERE, ".."), os.path.join(d, "repo", ".github", "reviewer"))
+            out_file = os.path.join(d, "github_output")
+            env = {"PATH": fake + os.pathsep + os.environ["PATH"], "HOME": d, "RUNNER_TEMP": d,
+                   "TESTS_ARTIFACT": name, "RESPONSE": os.path.join(d, "response.json"),
+                   "REPORT": os.path.join(d, "report.json"), "FILES": "tests/unit/slug.test.ts",
+                   "GITHUB_OUTPUT": out_file, "PYTHONDONTWRITEBYTECODE": "1"}
+            r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script],
+                               cwd=os.path.join(d, "repo"), env=env, capture_output=True, text=True)
+            written = open(out_file).read() if os.path.exists(out_file) else ""
+        return r.returncode, r.stdout + r.stderr, written
+
+    def test_all_red_on_stub_passes_under_bash_e(self):
+        code, out, written = self.run_step(["failed"] * 3)
+        self.assertEqual(code, 0, out)
+        self.assertIn("vitest on stub: exit 1", out)
+        self.assertIn("STUB_CHECK=PASS", out)
+        self.assertIn("artifact=agent-tests-", written)
+
+    def test_green_on_stub_fails_with_name(self):
+        code, out, written = self.run_step(["failed", "passed", "failed"])
+        self.assertEqual(code, 1, out)
+        self.assertIn("green_on_stub", out)
+        self.assertNotIn("artifact=", written)
