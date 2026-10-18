@@ -185,18 +185,24 @@ def write_probes(gh_knowledge, gh_probe):
     print(f"(п2) APPROVE on canary PR #{rl.CANARY_PR} with the probe token -> {status} (refused, as required)")
 
 
-def fetch_knowledge(gh_knowledge):
+def fetch_knowledge(gh_knowledge, prompt_path=rl.PROMPT_PATH, format_path=rl.FORMAT_PATH,
+                    contract=rl.check_schema_contract):
+    """Промпт и формат с одного коммита factory-knowledge; схема — из формата.
+
+    По умолчанию — ревьюера; автор тестов (test_author.py) передаёт свои пути и
+    свою проверку договора схемы.
+    """
     ref = gh_knowledge.json(f"/repos/{rl.KNOWLEDGE_REPO}/commits/{rl.KNOWLEDGE_REF}", "knowledge_ref")["sha"]
     q = urllib.parse.quote
-    prompt = gh_knowledge.raw(f"/repos/{rl.KNOWLEDGE_REPO}/contents/{q(rl.PROMPT_PATH)}?ref={ref}", "prompt")
-    fmt = gh_knowledge.raw(f"/repos/{rl.KNOWLEDGE_REPO}/contents/{q(rl.FORMAT_PATH)}?ref={ref}", "format")
+    prompt = gh_knowledge.raw(f"/repos/{rl.KNOWLEDGE_REPO}/contents/{q(prompt_path)}?ref={ref}", "prompt")
+    fmt = gh_knowledge.raw(f"/repos/{rl.KNOWLEDGE_REPO}/contents/{q(format_path)}?ref={ref}", "format")
     try:
         prompt_text, fmt_text = prompt.decode("utf-8"), fmt.decode("utf-8")
     except UnicodeDecodeError:
         raise rl.Unknown("knowledge_not_utf8")
-    rl.check_prompt_refers_format(prompt_text)
+    rl.check_prompt_refers_format(prompt_text, format_path)
     schema = rl.schema_from_format(fmt_text)
-    rl.check_schema_contract(schema)
+    contract(schema)
 
     def last_commit(path, what):
         commits = gh_knowledge.json(f"/repos/{rl.KNOWLEDGE_REPO}/commits?path={q(path)}&sha={ref}&per_page=1", what)
@@ -207,7 +213,7 @@ def fetch_knowledge(gh_knowledge):
     # Промпт ссылается на формат, а не повторяет его (D-104 §h): модели
     # уходят оба файла; SHA обоих — в комментарий и итог.
     instructions = prompt_text + "\n\n---\n\n" + fmt_text
-    return instructions, schema, last_commit(rl.PROMPT_PATH, "prompt_sha"), last_commit(rl.FORMAT_PATH, "format_sha")
+    return instructions, schema, last_commit(prompt_path, "prompt_sha"), last_commit(format_path, "format_sha")
 
 
 def review(ctx):
@@ -381,8 +387,10 @@ def _summary(lines):
             fh.write("```text\n" + "\n".join(lines) + "\n```\n")
 
 
-def _openai_factory():
-    for n in ("OPENAI_IDENTITY_PROVIDER_ID", "OPENAI_REVIEWER_SERVICE_ACCOUNT_ID", "OPENAI_WIF_AUDIENCE"):
+def _openai_factory(service_account_var="OPENAI_REVIEWER_SERVICE_ACCOUNT_ID", binding="Reviewer-Run"):
+    """Клиент OpenAI по WIF. Провайдер и audience общие; сервисный аккаунт — роли:
+    ревьюер (по умолчанию) или автор тестов (OPENAI_TEST_AUTHOR_SERVICE_ACCOUNT_ID)."""
+    for n in ("OPENAI_IDENTITY_PROVIDER_ID", service_account_var, "OPENAI_WIF_AUDIENCE"):
         if not os.environ.get(n):
             raise rl.Unknown(f"not_configured:{n}")
     import openai_smoke
@@ -390,23 +398,23 @@ def _openai_factory():
 
     from openai.auth import WorkloadIdentityAuth
 
-    # Параметры обмена — только из переменных ревьюера: OPENAI_SERVICE_ACCOUNT_ID
+    # Параметры обмена — только из переменных роли: OPENAI_SERVICE_ACCOUNT_ID
     # (привязка дымового теста) сюда не передаётся и не нужен (прогон 36518983506).
     wi = {"identity_provider_id": os.environ["OPENAI_IDENTITY_PROVIDER_ID"],
-          "service_account_id": os.environ["OPENAI_REVIEWER_SERVICE_ACCOUNT_ID"],
+          "service_account_id": os.environ[service_account_var],
           "provider": {"token_type": "jwt", "get_token": openai_smoke.github_oidc_token}}
-    # Обмен явно и первым: отказ привязки Reviewer-Run виден как отказ обмена,
+    # Обмен явно и первым: отказ привязки роли виден как отказ обмена,
     # с claims OIDC-токена (без самого токена) — по ним сверяется привязка.
     try:
         WorkloadIdentityAuth(workload_identity=wi).get_token()
-        print("Reviewer-Run token exchange: PASS (token not printed)")
+        print(f"{binding} token exchange: PASS (token not printed)")
     except Exception as exc:
         try:
             claims = json.dumps(openai_smoke.oidc_claims(), ensure_ascii=False)
         except Exception as cexc:
             claims = "unavailable: " + type(cexc).__name__
-        print(f"Reviewer-Run token exchange: FAIL — {oc.describe(exc)}; OIDC claims: {claims}")
-        raise rl.Unknown("reviewer_run_exchange:" + str(oc.error_code(exc)))
+        print(f"{binding} token exchange: FAIL — {oc.describe(exc)}; OIDC claims: {claims}")
+        raise rl.Unknown(binding.lower().replace("-", "_") + "_exchange:" + str(oc.error_code(exc)))
     return OpenAI(workload_identity=wi)
 
 
