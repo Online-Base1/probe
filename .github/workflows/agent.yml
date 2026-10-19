@@ -529,7 +529,7 @@ jobs:
             --max-turns 40
             --model claude-sonnet-5
             --settings '{"attribution":{"commit":false,"pr":false}}'
-            --allowedTools "Read,Glob,Grep,Edit(app/**),Edit(lib/**),Edit(components/**),Edit(prisma/**),Write(app/**),Write(lib/**),Write(components/**),Write(prisma/**),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(git push -u origin agent/*),Bash(gh pr create --draft:*)"
+            --allowedTools "Read,Glob,Grep,Edit(app/**),Edit(lib/**),Edit(components/**),Edit(prisma/**),Write(app/**),Write(lib/**),Write(components/**),Write(prisma/**),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(git push origin ${{ steps.freeze.outputs.branch }}),Bash(git push -u origin ${{ steps.freeze.outputs.branch }}),Bash(gh pr create --draft:*)"
             --disallowedTools "Edit(tests/**),Write(tests/**)"
           # Атрибуция (D-110 §e(а)): --settings с attribution в объектной
           # форме убирает трейлер Co-Authored-By и строку в описании PR — то
@@ -537,6 +537,12 @@ jobs:
           # способность. Имя настройки поставщика меняется с версией (класс
           # D-100 §e); это уборка, не контроль. Контроль — ruleset на agent/**.
           # Рамка 8 — слова для агента; границей тоже не является (D-089 §e).
+          #
+          # Push кодера — ровно в ветку прогона, обе формы (с -u и без):
+          # ветку с upstream уже создал Freeze tests, и кодер естественно пушит
+          # без -u (прогоны 39212022965, 39212573898 — отказы, заявки нет).
+          # Шаблон agent/* заменён точным именем: права уже, чем были (чужую
+          # agent/-ветку кодер больше не запушит), а не шире.
           #
           # Права кодера (D-174 §b(a)): запись — только продуктовые пути,
           # tests/ запрещён явно. Это удобство, не опора: опора — сверка дерева
@@ -555,6 +561,9 @@ jobs:
             Рамки (нарушать нельзя, даже если задача просит иного):
             1. Работай только в ветке `${{ steps.freeze.outputs.branch }}` — её уже
                создал workflow, ты в ней. Новых веток не создавай, в main не пиши.
+               Пушь ровно так: `git push origin ${{ steps.freeze.outputs.branch }}`
+               (другие формы push отклонят). Ты в корне репозитория: `git -C`
+               не используй, ветку не проверяй — она названа выше.
             2. Результат — ЧЕРНОВИК заявки: `gh pr create --draft --base main`.
                Тело заявки задавай сразу в этой же команде, флагом `--body "…"`
                (запись файлов вне продуктовых путей отклоняется). Сначала допиши
