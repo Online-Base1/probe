@@ -130,9 +130,17 @@ class Workflows(unittest.TestCase):
         self.assertEqual(writes, sorted(f"{t}({p}/**)" for t in ("Edit", "Write")
                                         for p in ("app", "lib", "components", "prisma")))
         self.assertNotIn("Bash(git checkout -b:*)", allowed)
+        # Push — только в ветку прогона, с -u и без (кодер пушит без -u:
+        # upstream ставит Freeze tests); шаблонов по agent/* нет.
+        pushes = sorted(a for a in allowed if a.startswith("Bash(git push"))
+        self.assertEqual(pushes, sorted([
+            "Bash(git push origin ${{ steps.freeze.outputs.branch }})",
+            "Bash(git push -u origin ${{ steps.freeze.outputs.branch }})"]))
+        self.assertFalse(any("*" in a for a in pushes))
         self.assertIn('--disallowedTools "Edit(tests/**),Write(tests/**)"', role)
         prompt = role[role.index("prompt: |"):]
         self.assertIn("${{ steps.freeze.outputs.branch }}", prompt)
+        self.assertIn("`git push origin ${{ steps.freeze.outputs.branch }}`", prompt)
         self.assertIn("Тесты в tests/ ЗАМОРОЖЕНЫ", prompt)
         self.assertNotIn("--body-file", prompt)
         self.assertIn("tests/unit/agent-tests-canary-{0}.txt", prompt)
